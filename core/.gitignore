@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 上传原文件（运行时生成）
+uploads/
+
+# 向量库运行时数据（Chroma 本地持久化）
+storage/chroma/
+
+# 本地环境变量（如需覆盖默认配置）
+.env

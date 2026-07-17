@@ -1,0 +1,67 @@
+@import "tailwindcss";
+
+/* 圆角分级（形状一致性锁） */
+@theme {
+  --radius-sm: 0.5rem;
+  --radius-md: 0.75rem;
+  --radius-lg: 1rem;
+}
+
+/* 亮色 token */
+:root {
+  --bg: #fafaf9;
+  --surface: #ffffff;
+  --surface-2: #f5f5f4;
+  --border: #e7e5e4;
+  --text: #1c1917;
+  --text-muted: #78716c;
+  --accent: #0d9488;
+  --accent-hover: #0f766e;
+  --danger: #dc2626;
+  --warning: #d97706;
+  --success: #16a34a;
+}
+
+/* 暗色 token（M13.8 主题切换） */
+.dark {
+  --bg: #18181b;
+  --surface: #27272a;
+  --surface-2: #1f1f23;
+  --border: #3f3f46;
+  --text: #fafaf9;
+  --text-muted: #a1a1aa;
+  --accent: #2dd4bf;
+  --accent-hover: #14b8a6;
+}
+
+/* 语义化工具类（单一强调色 teal，全站锁定） */
+@utility bg-app { background-color: var(--bg); }
+@utility bg-surface { background-color: var(--surface); }
+@utility bg-surface2 { background-color: var(--surface-2); }
+@utility text-app { color: var(--text); }
+@utility text-muted { color: var(--text-muted); }
+@utility border-app { border-color: var(--border); }
+@utility bg-accent { background-color: var(--accent); }
+@utility bg-accent-hover { background-color: var(--accent-hover); }
+@utility text-accent { color: var(--accent); }
+@utility border-accent { border-color: var(--accent); }
+@utility ring-accent { --tw-ring-color: var(--accent); }
+
+* {
+  border-color: var(--border);
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Plus Jakarta Sans', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 尊重 prefers-reduced-motion */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

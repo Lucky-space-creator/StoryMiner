@@ -1,5 +1,38 @@
-# Object file
-*.o
+# ===== 用户明确禁止上传的内容 =====
+# 需求文档
+小说解析RAG系统需求文档.md
+需求分析.md
+# 测试文件 / 草稿脚本
+**/_*.py
+core/test_*.py
+core/test_data/
+core/cleanup_test_data.py
+core/cookie.txt
+core/test_dash.cmd
+# API 目录
+API/
+# bug 与潜在需求分析
+bug和潜在需求分析
+# 日志
+*.log
 
-# Ada Library Information
-*.ali
+# ===== 依赖与构建产物 =====
+.venv/
+node_modules/
+__pycache__/
+*.pyc
+*.sqlite3
+static/dist/
+dist/
+build/
+
+# ===== 环境与工具目录 =====
+.env
+.env.*
+.codebuddy/
+
+# ===== 编辑器 / 系统 =====
+.idea/
+.DS_Store
+Thumbs.db
+*.swp

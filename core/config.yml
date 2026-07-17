@@ -1,0 +1,48 @@
+# 小说解析 RAG 系统 - 运行配置
+# 说明：本文件为配置源；环境变量可覆盖对应项（优先级：环境变量 > 本文件）。
+# 开发期可直接改本文件，生产环境建议用环境变量注入敏感信息（如数据库密码、JWT 密钥）。
+
+# 数据库连接（SQLAlchemy 异步 DSN）
+database:
+  dsn: "postgresql+asyncpg://postgres:root@localhost:5432/story_rag"
+
+# JWT 鉴权
+jwt:
+  secret: "story-rag-dev-secret-change-me"
+  algorithm: "HS256"
+  expire_minutes: 60
+
+# 上传限制（对齐 API 列表：TXT≤50MB、其他≤200MB、章节≤5000）
+upload:
+  dir: "uploads"                       # 相对 core 目录；运行时会解析为绝对路径
+  max_txt_bytes: 52428800              # 50MB
+  max_other_bytes: 209715200           # 200MB
+  max_chapters: 5000
+  allowed_ext:
+    - ".txt"
+    - ".epub"
+    - ".pdf"
+    - ".docx"
+
+# CORS（开发期放开，生产请收紧）
+cors:
+  origins:
+    - "*"
+
+# 向量库（当前 chroma 本地持久化；后续可切 milvus / pgvector，仅改 type 与对应段）
+vector_store:
+  type: chroma
+  chroma:
+    persist_dir: "storage/chroma"
+
+# 存储后端（local / minio）；接入 MinIO 后默认走对象存储
+storage:
+  backend: minio
+
+# MinIO 对象存储（接入信息）
+minio:
+  endpoint: "127.0.0.1:9000"
+  access_key: "minioadmin"
+  secret_key: "minioadmin"
+  bucket: "story-rag"
+  secure: false
