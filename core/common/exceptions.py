@@ -14,7 +14,7 @@
 class BizError(Exception):
     """业务异常：携带错误码与提示信息。"""
 
-    def __init__(self, code: int = 1, msg: str = "error"):
+    def __init__(self, code: int, msg: str = "error"):
         self.code = code
         self.msg = msg
         super().__init__(msg)

@@ -18,8 +18,10 @@ from models.user import User
 from db import get_session
 from auth.jwt import get_current_user
 from common.response import success, paginate
+from common.exceptions import BizError
 from schemas.novel import NovelCreate, NovelUpdate, ChapterCorrect, ChapterSplit, ChapterMerge
-from services import novel_service, parse_service
+from services import novel_service, parse_service, kb_service
+from repositories import novel_repo
 
 router = APIRouter(prefix="/novels", tags=["novels"])
 
@@ -71,13 +73,35 @@ async def delete_novel(novel_id: int, user: User = Depends(get_current_user), se
 
 @router.post("/{novel_id}/upload")
 async def upload(
-    novel_id: int, file: UploadFile,
+    novel_id: int, files: list[UploadFile],
     background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user), session=Depends(get_session),
 ):
-    """上传文档并触发异步解析（M1.2/M1.7）。"""
-    result = await parse_service.handle_upload(session, user.id, novel_id, file, background_tasks)
-    return success(result, "上传成功，开始解析")
+    """上传文档（方案A：支持多文件）并逐个触发异步解析，文档归属小说。"""
+    if not await novel_repo.get_novel(session, user.id, novel_id):
+        raise BizError(404, "小说不存在")
+    results = []
+    for f in files:
+        try:
+            r = await parse_service.handle_upload(session, user.id, novel_id, f, background_tasks)
+            results.append(r)
+        except BizError as e:
+            results.append({"name": f.filename, "error": e.msg})
+    return success(results, "上传完成")
+
+
+@router.get("/{novel_id}/documents")
+async def novel_documents(
+    novel_id: int,
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=500),
+    user: User = Depends(get_current_user), session=Depends(get_session),
+):
+    """小说下文档列表（方案A：文档归属小说，供详情页 CRUD 与构建选文件）。"""
+    if not await novel_repo.get_novel(session, user.id, novel_id):
+        raise BizError(404, "小说不存在")
+    items, total = await novel_repo.list_documents_by_novel(session, novel_id, page, size)
+    return success(paginate([kb_service.doc_out(d) for d in items], total, page, size))
 
 
 @router.get("/{novel_id}/chapters")

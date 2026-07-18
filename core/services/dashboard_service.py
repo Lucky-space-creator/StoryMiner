@@ -18,10 +18,12 @@ from collections import defaultdict
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models.novel_content import Novel, KnowledgeBase, ParseTask
+from models.novel_content import Novel, KnowledgeBase
+from models.async_task import AsyncTask
 from models.chunk import Chunk
 from models.graph import Entity
 from models.llm_config import LLMUsage
+from services import task_service
 
 
 async def get_stats(session: AsyncSession, owner_id: int) -> dict:
@@ -123,18 +125,11 @@ async def get_model_stats(session: AsyncSession, owner_id: int) -> list[dict]:
 
 
 async def get_task_overview(session: AsyncSession, owner_id: int) -> dict:
-    """异步任务进度总览（M14.1）：汇总当前用户解析/切割任务及状态计数。"""
+    """异步任务进度总览（M14.1）：汇总当前用户所有统一异步任务及状态计数。"""
     items = (await session.execute(
-        select(ParseTask).where(ParseTask.owner_id == owner_id).order_by(ParseTask.id.desc())
+        select(AsyncTask).where(AsyncTask.owner_id == owner_id).order_by(AsyncTask.id.desc())
     )).scalars().all()
-    tasks = [{
-        "id": t.id, "novel_id": t.novel_id, "doc_id": t.doc_id,
-        "stage": t.stage, "progress": t.progress, "status": t.status,
-        "error": t.error,
-        "started_at": t.started_at.isoformat() if t.started_at else None,
-        "finished_at": t.finished_at.isoformat() if t.finished_at else None,
-        "created_at": t.created_at.isoformat() if t.created_at else None,
-    } for t in items]
+    tasks = [task_service._out(t) for t in items]
     summary = {
         "total": len(tasks),
         "running": sum(1 for t in tasks if t["status"] == "running"),

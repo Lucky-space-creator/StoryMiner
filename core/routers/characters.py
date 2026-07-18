@@ -12,7 +12,7 @@
 实现逻辑：
     委托 character_service；归属校验在 service 内完成，路由仅做参数传递。
 """
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, BackgroundTasks
 from pydantic import BaseModel
 
 from models.user import User
@@ -20,7 +20,8 @@ from db import get_session
 from auth.jwt import get_current_user
 from common.response import success
 from common.exceptions import BizError
-from services import character_service
+from services import character_service, task_service
+from repositories import character_repo, novel_repo
 
 # 列表/新建：与小说资源同域
 novel_router = APIRouter(prefix="/novels", tags=["characters"])
@@ -106,9 +107,43 @@ async def delete_character(
 @char_router.post("/{char_id}/generate")
 async def generate_profile(
     char_id: int,
+    background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user),
     session=Depends(get_session),
 ):
-    """AI 生成小传（M6.2）：基于全文生成结构化档案并写回。"""
-    data = await character_service.generate_profile(session, char_id, user.id)
-    return success(data, "小传已生成")
+    """AI 生成小传（M6.2）：后台异步生成结构化档案并写回，立即返回统一 task_id。"""
+    char = await character_repo.get(session, char_id)
+    if not char or char.owner_id != user.id or char.deleted_at is not None:
+        raise BizError(404, "人物不存在")
+    novel = await novel_repo.get_novel(session, user.id, char.novel_id)
+    novel_name = novel.name if novel else f"人物{char.name}"
+    task = await task_service.create_task(session, user.id, "character", f"小说{novel_name}-人物抽取实体", novel_id=char.novel_id, target_id=char_id)
+    background_tasks.add_task(character_service.generate_profile_async, char_id, user.id, task.id)
+    return success({"task_id": task.id}, "已启动小传生成")
+
+
+@novel_router.post("/{novel_id}/analyze-characters")
+async def analyze_characters(
+    novel_id: int,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    session=Depends(get_session),
+):
+    """任务分析（小说详情页）：基于小说简介和正文，LLM 自动分析并创建人物档案。
+
+    后台异步执行，立即返回统一 task_id 供仪表盘轮询进度。
+    """
+    novel = await novel_repo.get_novel(session, user.id, novel_id)
+    if not novel:
+        raise BizError(404, "小说不存在")
+    task = await task_service.create_task(
+        session, user.id, "character_analysis",
+        f"小说{novel.name}-人物分析", novel_id=novel_id,
+    )
+    background_tasks.add_task(
+        character_service.analyze_and_create_characters,
+        novel_id=novel_id, owner_id=user.id,
+        novel_name=novel.name, summary=novel.summary or "",
+        async_task_id=task.id,
+    )
+    return success({"task_id": task.id}, "已启动人物分析")

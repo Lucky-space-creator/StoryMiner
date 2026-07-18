@@ -2,6 +2,9 @@
   <div class="space-y-6" v-if="novel">
     <div class="flex items-start justify-between gap-4">
       <div>
+        <button class="text-sm text-muted hover:text-app mb-1" @click="$router.push('/novels')">
+          ← 返回小说
+        </button>
         <h2 class="text-xl font-semibold text-app">{{ novel.name }}</h2>
         <p class="text-sm text-muted mt-1">作者：{{ novel.author }}</p>
         <div class="flex flex-wrap gap-1 mt-2">
@@ -9,152 +12,259 @@
         </div>
       </div>
       <div class="flex gap-2 shrink-0">
-        <input ref="fileEl" type="file" accept=".txt,.epub,.pdf,.docx" class="hidden" @change="onFile" />
-        <Button variant="secondary" :loading="uploading" @click="fileEl?.click()">上传文档</Button>
+        <input ref="docsEl" type="file" accept=".txt,.epub,.pdf,.docx" multiple class="hidden" @change="onFiles" />
+        <Button variant="secondary" :loading="uploading" @click="docsEl?.click()">上传文档</Button>
         <Button @click="goKb">建知识库</Button>
+        <Button variant="secondary" :loading="analyzing" @click="analyzeNovel">人物分析</Button>
       </div>
     </div>
 
-    <p class="text-sm text-app">{{ novel.summary }}</p>
+    <p class="text-sm text-app">{{ novel.summary || '（暂无简介）' }}</p>
+
+    <!-- AI 概括：上传文档解析完成后由异步任务生成，展示在用户简介下方 -->
+    <div v-if="novel.ai_summary" class="bg-surface2 border border-app rounded-[var(--radius-sm)] p-3">
+      <div class="flex items-center gap-1.5 mb-1.5">
+        <span class="text-xs font-medium text-accent">AI 概括</span>
+        <span class="text-xs text-muted">· 由大模型基于小说正文生成</span>
+      </div>
+      <p class="text-sm text-app leading-relaxed">{{ novel.ai_summary }}</p>
+    </div>
 
     <Card>
       <div class="flex items-center justify-between mb-3 gap-3 flex-wrap">
-        <h3 class="font-medium text-app">章节列表（{{ total }}）</h3>
-        <div class="flex items-center gap-2">
-          <Input v-model="keyword" placeholder="搜索章节标题" @keyup.enter="onSearch" />
-          <Button variant="secondary" size="sm" @click="onSearch">查询</Button>
-        </div>
+        <h3 class="font-medium text-app">已上传文档（{{ total }}）</h3>
+        <Button variant="ghost" size="sm" :loading="loading" @click="loadDocs">刷新</Button>
       </div>
+
       <div v-if="loading" class="space-y-2">
-        <Skeleton v-for="i in 5" :key="i" h="2.25rem" />
+        <Skeleton v-for="i in 4" :key="i" h="2.25rem" />
       </div>
-      <Table v-else :columns="columns" :rows="chapters">
+      <Table v-else :columns="docColumns" :rows="documents">
+        <template #cell-status="{ value }">
+          <span :class="statusClass(value)">{{ statusText(value) }}</span>
+        </template>
         <template #cell-actions="{ row }">
-          <Button variant="ghost" size="sm" @click="openChapter(row)">查看</Button>
+          <div class="flex gap-1">
+            <Button variant="ghost" size="sm" @click="openRename(row)">重命名</Button>
+            <Button variant="ghost" size="sm" class="text-danger" @click="askDelete(row)">删除</Button>
+          </div>
         </template>
       </Table>
+
       <Pagination
-        v-if="!loading"
+        v-if="!loading && total > 0"
         :page="page" :size="size" :total="total"
-        @update:page="(p) => { page = p; loadChapters() }"
-        @update:size="(s) => { size = s; page = 1; loadChapters() }"
+        @update:page="(p) => { page = p; loadDocs() }"
+        @update:size="(s) => { size = s; page = 1; loadDocs() }"
       />
+      <EmptyState v-if="!loading && total === 0" title="还没有文档" desc="点击右上角「上传文档」添加 TXT/EPUB/PDF/DOCX" />
     </Card>
 
-    <!-- 章节查看/编辑抽屉 -->
-    <Drawer v-model="drawerOpen" :title="drawerTitle">
-      <div v-if="current" class="space-y-4">
-        <Input v-model="editForm.title" label="标题" :disabled="!editing" />
-        <div>
-          <span class="block text-sm text-app mb-1.5">内容</span>
-          <textarea
-            v-model="editForm.content"
-            :disabled="!editing"
-            rows="18"
-            class="w-full px-3 py-2 rounded-[var(--radius-sm)] bg-surface2 border border-app text-app placeholder:text-muted focus:outline-none focus:ring-2 ring-accent transition font-mono text-xs"
-          ></textarea>
-          <span class="text-xs text-muted">字数：{{ editForm.content?.length || 0 }}</span>
-        </div>
+    <Modal v-model="renameOpen" title="重命名文档">
+      <form @submit.prevent="submitRename" class="space-y-4">
+        <Input v-model="renameForm.name" label="文档名称" placeholder="请输入名称" />
         <div class="flex justify-end gap-2">
-          <Button v-if="!editing" variant="secondary" @click="editing = true">编辑</Button>
-          <template v-else>
-            <Button variant="ghost" @click="cancelEdit">取消</Button>
-            <Button :loading="saving" @click="saveChapter">保存</Button>
-          </template>
+          <Button variant="ghost" type="button" @click="renameOpen = false">取消</Button>
+          <Button type="submit" :loading="renaming">保存</Button>
         </div>
-      </div>
-      <div v-else class="text-sm text-muted">加载中…</div>
-    </Drawer>
+      </form>
+    </Modal>
+
+    <ConfirmDialog v-model="delOpen" title="删除文档" :message="`确定删除《${pending?.name}》？该文档在所有知识库的切片与向量将一并清除，且不可恢复。`" @confirm="doDelete" />
   </div>
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue'
+// 小说详情（方案A）：仅展示简介 + 已上传文档的 CRUD 与分页；切章/切分在知识库构建阶段完成。
+// 整体思路：进入页面拉取小说元信息与分页文档；上传触发异步解析，轮询刷新至全部完成。
+// 关键点：
+//   1. 文档归属小说，列表接口 GET /novels/{id}/documents 已分页。
+//   2. 上传支持多文件，逐个解析；状态 pending/parsing/done/failed 实时反映。
+//   3. 删除/重命名走 /documents/{id}，按 owner 隔离。
+import { ref, reactive, onMounted, onBeforeUnmount } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import Card from '@/components/ui/Card.vue'
 import Button from '@/components/ui/Button.vue'
 import Tag from '@/components/ui/Tag.vue'
 import Table from '@/components/ui/Table.vue'
 import Skeleton from '@/components/ui/Skeleton.vue'
-import Drawer from '@/components/ui/Drawer.vue'
+import Modal from '@/components/ui/Modal.vue'
 import Input from '@/components/ui/Input.vue'
 import Pagination from '@/components/ui/Pagination.vue'
-import { getNovel, listChapters, uploadDocument, getChapter, correctChapter } from '@/api/novels'
-import { useSSE } from '@/composables/useSSE'
+import EmptyState from '@/components/ui/EmptyState.vue'
+import ConfirmDialog from '@/components/ui/ConfirmDialog.vue'
+import { getNovel, listNovelDocuments, uploadDocuments, deleteNovelDocument, renameNovelDocument } from '@/api/novels'
+import { analyzeCharacters } from '@/api/characters'
 import { useToast } from '@/composables/useToast'
-import { useTaskProgressStore } from '@/stores/taskProgress'
 
-// 小说详情（M1）：加载小说与章节（分页/查询），上传文档经 SSE 跟踪解析进度，
-// 章节支持「查看」抽屉内编辑并保存（M1.4 校正）。
-// 整体思路：
-//   进入页面拉取小说元信息与分页章节；上传触发异步解析，SSE 推送进度；
-//   点击「查看」拉取章节正文到抽屉，可切换编辑模式保存。
-// 关键点：
-//   1. 列表接口已分页，loadChapters 携带 page/size/q。
-//   2. 章节正文较大，列表不含 content，查看时单独 GET /chapters/{id}。
-//   3. 编辑保存调用 correctChapter，成功后回写 current 并刷新列表。
-// 实现逻辑：
-//   调 api/novels 真实接口；useSSE 订阅 /parse-tasks/{id}/progress；抽屉内 reactive 表单双向绑定。
 const route = useRoute()
 const router = useRouter()
 const { notify } = useToast()
-const task = useTaskProgressStore()
 const novel = ref(null)
-const chapters = ref([])
+const documents = ref([])
 const loading = ref(true)
 const uploading = ref(false)
-const fileEl = ref(null)
+const analyzing = ref(false)
+const docsEl = ref(null)
 
-// 分页与查询状态
+// 分页状态
 const page = ref(1)
 const size = ref(20)
 const total = ref(0)
-const keyword = ref('')
 
-// 抽屉/编辑状态
-const drawerOpen = ref(false)
-const current = ref(null)
-const editing = ref(false)
-const saving = ref(false)
-const editForm = reactive({ title: '', content: '' })
+// 重命名 / 删除状态
+const renameOpen = ref(false)
+const renaming = ref(false)
+const renameForm = reactive({ id: null, name: '' })
+const delOpen = ref(false)
+const pending = ref(null)
 
-const columns = [
-  { key: 'chapter_no', label: '序号' },
-  { key: 'title', label: '标题' },
+const docColumns = [
+  { key: 'id', label: 'ID' },
+  { key: 'name', label: '名称' },
+  { key: 'doc_type', label: '类型' },
+  { key: 'status', label: '状态' },
   { key: 'word_count', label: '字数' },
+  { key: 'created_at', label: '上传时间' },
   { key: 'actions', label: '操作' }
 ]
 
-const drawerTitle = computed(() => (editing.value ? '编辑章节' : '查看章节'))
+const statusMap = { done: '已完成', parsing: '解析中', pending: '待解析', failed: '失败' }
+function statusText(s) { return statusMap[s] || s }
+function statusClass(s) {
+  return {
+    'text-accent': s === 'done',
+    'text-warning': s === 'parsing' || s === 'pending',
+    'text-danger': s === 'failed',
+    'text-muted': !s,
+  }
+}
 
-async function loadChapters() {
+let pollTimer = null
+function clearPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null } }
+
+async function loadDocs() {
   loading.value = true
   try {
-    const res = await listChapters(route.params.id, {
-      page: page.value, size: size.value, q: keyword.value || undefined
-    })
+    const res = await listNovelDocuments(route.params.id, { page: page.value, size: size.value })
     const d = res.data || {}
-    chapters.value = d.list || []
+    documents.value = d.list || []
     total.value = d.total || 0
     page.value = d.page || page.value
     size.value = d.size || size.value
   } catch (e) {
-    notify(e.message || '加载章节失败', 'error')
+    notify(e.message || '加载文档失败', 'error')
   } finally {
     loading.value = false
   }
 }
 
-function onSearch() {
-  page.value = 1
-  loadChapters()
+// 解析中轮询：全部完成时停止；同时刷新小说详情以获取 AI 概括
+function maybePoll() {
+  const active = documents.value.some((d) => d.status === 'pending' || d.status === 'parsing')
+  if (active && !pollTimer) {
+    pollTimer = setInterval(async () => {
+      await loadDocs()
+      // 刷新小说详情（用于拿 AI 概括 ai_summary）
+      try {
+        const res = await getNovel(route.params.id)
+        if (res.data) novel.value = { ...novel.value, ...res.data }
+      } catch (e) { /* 忽略刷新失败 */ }
+      if (!documents.value.some((d) => d.status === 'pending' || d.status === 'parsing')) {
+        // 解析全部完成后再补一次小说详情，确保拿到最终 AI 概括
+        try {
+          const res = await getNovel(route.params.id)
+          if (res.data) novel.value = { ...novel.value, ...res.data }
+        } catch (e) { /* 忽略 */ }
+        clearPoll()
+      }
+    }, 2000)
+  }
+}
+
+function onFiles(e) {
+  const files = Array.from(e.target.files || [])
+  if (!files.length) return
+  uploadAll(files)
+  if (docsEl.value) docsEl.value.value = ''
+}
+
+async function uploadAll(files) {
+  uploading.value = true
+  try {
+    await uploadDocuments(route.params.id, files)
+    notify(`已开始解析 ${files.length} 个文件`, 'info')
+    page.value = 1
+    await loadDocs()
+    maybePoll()
+  } catch (e) {
+    notify(e.message || '上传失败', 'error')
+  } finally {
+    uploading.value = false
+  }
+}
+
+function goKb() {
+  router.push({ path: '/knowledge-bases', query: { novel_id: novel.value?.id } })
+}
+
+async function analyzeNovel() {
+  analyzing.value = true
+  try {
+    const res = await analyzeCharacters(route.params.id)
+    notify(`人物分析已启动（任务 #${res.data?.task_id || '—'}），可在仪表盘查看进度`, 'info')
+  } catch (e) {
+    notify(e.message || '启动人物分析失败', 'error')
+  } finally {
+    analyzing.value = false
+  }
+}
+
+function openRename(row) {
+  renameForm.id = row.id
+  renameForm.name = row.name
+  renameOpen.value = true
+}
+
+async function submitRename() {
+  if (!renameForm.name.trim()) return
+  renaming.value = true
+  try {
+    await renameNovelDocument(renameForm.id, renameForm.name.trim())
+    renameOpen.value = false
+    notify('已重命名', 'success')
+    await loadDocs()
+  } catch (e) {
+    notify(e.message || '重命名失败', 'error')
+  } finally {
+    renaming.value = false
+  }
+}
+
+function askDelete(row) {
+  pending.value = row
+  delOpen.value = true
+}
+
+async function doDelete() {
+  if (!pending.value) return
+  try {
+    await deleteNovelDocument(pending.value.id)
+    documents.value = documents.value.filter((x) => x.id !== pending.value.id)
+    total.value = Math.max(0, total.value - 1)
+    notify(`已删除《${pending.value.name}》`, 'success')
+  } catch (e) {
+    notify(e.message || '删除失败', 'error')
+  } finally {
+    pending.value = null
+  }
 }
 
 onMounted(async () => {
   try {
     const res = await getNovel(route.params.id)
     novel.value = res.data || null
-    await loadChapters()
+    await loadDocs()
   } catch (e) {
     notify(e.message || '加载失败', 'error')
   } finally {
@@ -162,88 +272,5 @@ onMounted(async () => {
   }
 })
 
-function goKb() {
-  router.push('/knowledge-bases')
-}
-
-async function onFile(e) {
-  const file = e.target.files?.[0]
-  if (!file) return
-  uploading.value = true
-  try {
-    const res = await uploadDocument(route.params.id, file)
-    const taskId = res.data.task_id
-    const name = res.data.name || file.name
-    task.upsert({ id: taskId, name, progress: 0, stage: '排队中' })
-    task.show()
-    startProgress(taskId, name)
-    notify('已开始解析，进度见右下角', 'info')
-  } catch (err) {
-    notify(err.message || '上传失败', 'error')
-  } finally {
-    uploading.value = false
-    if (fileEl.value) fileEl.value.value = ''
-  }
-}
-
-// 订阅 SSE 解析进度（M1.11）：?token= 携带鉴权。
-function startProgress(taskId, name) {
-  const token = localStorage.getItem('token') || ''
-  const url = `/api/v1/parse-tasks/${taskId}/progress?token=${encodeURIComponent(token)}`
-  const { connect, close } = useSSE(url, (ev) => {
-    task.upsert({ id: taskId, name, progress: ev.progress || 0, stage: ev.stage || '' })
-    if (ev.status === 'success') {
-      close()
-      loadChapters()
-      notify(`《${name}》解析完成`, 'success')
-    } else if (ev.status === 'failed') {
-      close()
-      notify(`解析失败：${ev.payload?.error || '未知错误'}`, 'error')
-    }
-  })
-  connect()
-}
-
-// 打开章节查看抽屉：拉取正文并初始化编辑表单。
-async function openChapter(row) {
-  drawerOpen.value = true
-  editing.value = false
-  current.value = null
-  try {
-    const res = await getChapter(row.id)
-    current.value = res.data || null
-    editForm.title = current.value?.title || ''
-    editForm.content = current.value?.content || ''
-  } catch (e) {
-    notify(e.message || '加载章节失败', 'error')
-  }
-}
-
-// 取消编辑：回滚表单到查看态。
-function cancelEdit() {
-  editForm.title = current.value?.title || ''
-  editForm.content = current.value?.content || ''
-  editing.value = false
-}
-
-// 保存章节编辑：调校正接口，成功后回写并刷新列表。
-async function saveChapter() {
-  if (!current.value) return
-  saving.value = true
-  try {
-    const res = await correctChapter(current.value.id, {
-      title: editForm.title, content: editForm.content
-    })
-    current.value = res.data || current.value
-    editForm.title = current.value.title || ''
-    editForm.content = current.value.content || ''
-    editing.value = false
-    notify('章节已保存', 'success')
-    loadChapters()
-  } catch (e) {
-    notify(e.message || '保存失败', 'error')
-  } finally {
-    saving.value = false
-  }
-}
+onBeforeUnmount(() => clearPoll())
 </script>

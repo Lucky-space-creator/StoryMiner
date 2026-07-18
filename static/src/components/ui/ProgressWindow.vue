@@ -17,7 +17,10 @@
           <div class="h-1.5 bg-surface2 rounded-full overflow-hidden">
             <div class="h-full bg-accent transition-all duration-300" :style="{ width: t.progress + '%' }"></div>
           </div>
-          <p class="text-xs text-muted mt-1">{{ t.stage }}</p>
+          <p class="text-xs text-muted mt-1 flex items-center gap-2">
+            <span class="px-1.5 py-0.5 rounded bg-surface2 text-accent">{{ typeText(t.type) }}</span>
+            <span :class="t.status === 'failed' ? 'text-red-600' : ''">{{ t.stage }}</span>
+          </p>
         </div>
       </div>
     </div>
@@ -27,5 +30,6 @@
 <script setup>
 import { useTaskProgressStore } from '@/stores/taskProgress'
 import { PhCaretDown } from '@phosphor-icons/vue'
+import { typeText } from '@/utils/taskStages'
 const store = useTaskProgressStore()
 </script>

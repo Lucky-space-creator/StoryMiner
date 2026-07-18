@@ -53,7 +53,7 @@
           <div>
             <h3 class="text-app font-medium">{{ n.title }}</h3>
             <p class="text-sm text-muted mt-1">{{ n.content }}</p>
-            <p class="text-xs text-muted mt-2">更新于 {{ n.updated_at }}</p>
+            <p class="text-xs text-muted mt-2">更新于 {{ formatDateTime(n.updated_at) }}</p>
           </div>
           <Button variant="ghost" size="sm" @click="removeNote(n)">删除</Button>
         </div>
@@ -135,6 +135,7 @@ import {
   listAuditLogs,
 } from '@/api/explore'
 import { useToast } from '@/composables/useToast'
+import { formatDateTime } from '@/utils/datetime'
 
 // 扩展功能视图（M13）：全局搜索 + 笔记/标签/收藏/审计，所有写操作带成功/失败 toast 提示。
 // 整体思路：

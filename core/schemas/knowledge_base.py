@@ -13,6 +13,7 @@
     继承 pydantic BaseModel。
 """
 from pydantic import BaseModel, Field
+from schemas.chunk import ChunkRequest
 
 
 class KBCreate(BaseModel):
@@ -41,6 +42,7 @@ class KBOut(BaseModel):
     description: str | None = None
     scope: str
     config: dict = {}
+    embedding_model: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
 
@@ -48,7 +50,12 @@ class KBOut(BaseModel):
 class KBStatsOut(BaseModel):
     """知识库统计出参（M2.9）。"""
     kb_id: int
-    document_count: int
+    doc_count: int
     chunk_count: int
-    word_count: int
+    chars: int
     updated_at: str | None = None
+
+
+class BuildRequest(ChunkRequest):
+    """构建索引入参（方案A：构建时单选文档）：doc_id 指定参与切分向量化的文档。"""
+    doc_id: int = Field(..., description="参与构建的文档 id")

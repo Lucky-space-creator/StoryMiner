@@ -39,9 +39,12 @@
       </div>
       <div class="space-y-2">
         <div v-for="t in tasks" :key="t.id" class="border border-stone-200 rounded p-3 cursor-pointer hover:border-teal-400 transition" @click="openDetail(t)">
-          <div class="flex items-center justify-between text-sm">
-            <span class="font-medium text-app">任务 #{{ t.id }}<span v-if="t.novel_id" class="text-muted font-normal"> · 小说{{ t.novel_id }}</span></span>
-            <span :class="statusClass(t.status)">{{ statusLabel(t.status) }}</span>
+          <div class="flex items-center justify-between text-sm gap-2">
+            <span class="font-medium text-app truncate">{{ t.name || ('任务 #' + t.id) }}</span>
+            <span class="flex items-center gap-2 shrink-0">
+              <span class="text-xs px-1.5 py-0.5 rounded bg-surface2 text-accent">{{ typeText(t.type) }}</span>
+              <span :class="statusClass(t.status)">{{ statusLabel(t.status) }}</span>
+            </span>
           </div>
           <div class="flex items-center gap-2 text-xs text-muted mt-1">
             <span>阶段：{{ stageLabel(t.stage) }}</span>
@@ -81,7 +84,7 @@
           <pre v-if="selectedTask.error" class="whitespace-pre-wrap break-words bg-stone-50 border border-stone-200 rounded p-2 text-red-600 text-xs">{{ selectedTask.error }}</pre>
           <p v-else class="text-app text-xs">无</p>
         </div>
-        <Button v-if="selectedTask.status === 'failed'" :disabled="retrying" @click="onRetry(selectedTask.id)">
+        <Button v-if="selectedTask.status === 'failed' && selectedTask.type === 'parse'" :disabled="retrying" @click="onRetry(selectedTask.id)">
           {{ retrying ? '重试中…' : '一键重试' }}
         </Button>
       </div>
@@ -97,6 +100,7 @@ import Drawer from '@/components/ui/Drawer.vue'
 import Button from '@/components/ui/Button.vue'
 import { getStats, getTokenUsage, getTokenTrend, getModelStats, getTaskOverview } from '@/api/dashboard'
 import { retryParseTask } from '@/api/parseTasks'
+import { typeText } from '@/utils/taskStages'
 
 const statCards = ref([])
 const usage = ref({ tokensIn: 0, tokensOut: 0, calls: 0, cost: 0 })
@@ -109,6 +113,7 @@ const trendEl = ref(null)
 const modelEl = ref(null)
 let trendChart = null
 let modelChart = null
+let taskTimer = null
 
 function openDetail(t) {
   selectedTask.value = t
@@ -116,21 +121,28 @@ function openDetail(t) {
 }
 
 async function onRetry(taskId) {
+  // 仅解析类任务支持一键重试（复用既有 /parse-tasks 重试接口，按 extra.parse_task_id 定位）
   retrying.value = true
   try {
-    await retryParseTask(taskId)
+    const parseTaskId = selectedTask.value?.extra?.parse_task_id || taskId
+    await retryParseTask(parseTaskId)
     drawerVisible.value = false
-    // 重新拉取任务总览，刷新列表与计数
-    const res = await getTaskOverview()
-    tasks.value = res.data.tasks || []
-    taskSummary.value = res.data.summary || { total: 0, running: 0, success: 0, failed: 0 }
+    await refreshTasks()
   } finally {
     retrying.value = false
   }
 }
 
+async function refreshTasks() {
+  const res = await getTaskOverview()
+  tasks.value = res.data.tasks || []
+  taskSummary.value = res.data.summary || { total: 0, running: 0, success: 0, failed: 0 }
+}
+
 const STAGE_LABEL = {
-  pending: '待解析', parsing: '解析中', splitting: '切章中', done: '已完成', failed: '失败',
+  pending: '排队中', preparing: '准备中', parsing: '解析中', splitting: '切章中',
+  chunking: '切分文档', embedding: '向量化中', storing: '写入索引',
+  extracting: '抽取实体中', generating: '生成小传中', done: '已完成', failed: '失败',
 }
 const STATUS_LABEL = { running: '进行中', success: '成功', failed: '失败' }
 function stageLabel(s) { return STAGE_LABEL[s] || s || '未知' }
@@ -195,10 +207,13 @@ onMounted(async () => {
   tasks.value = taskRes.data.tasks || []
   taskSummary.value = taskRes.data.summary || { total: 0, running: 0, success: 0, failed: 0 }
   window.addEventListener('resize', resize)
+  // 每 5s 刷新异步任务总览（进行中任务进度/状态实时更新）
+  taskTimer = setInterval(refreshTasks, 5000)
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', resize)
+  if (taskTimer) clearInterval(taskTimer)
   trendChart?.dispose()
   modelChart?.dispose()
 })

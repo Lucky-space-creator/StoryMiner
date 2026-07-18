@@ -68,6 +68,21 @@ if isinstance(_CORS_ORIGINS, list):
 else:
     CORS_ORIGINS = str(_CORS_ORIGINS).split(",")
 
+# 后台异步任务线程池配置
+# 关键点：CPU 密集型任务（切章）与慢速 LLM 调用放到独立线程执行，
+#         避免阻塞主 asyncio 事件循环导致用户请求卡顿。
+_bg = _cfg.get("background", {})
+BG_THREAD_POOL_SIZE = int(os.getenv("BG_THREAD_POOL_SIZE", _bg.get("thread_pool_size", 8)))
+BG_TASK_TIMEOUT = int(os.getenv("BG_TASK_TIMEOUT", _bg.get("task_timeout", 300)))
+
+# 切片嵌入/落库并发与批大小（Chroma-only 流式分批，控制内存与远端压力）
+#   embed_batch：单次嵌入请求携带的文本条数（OpenAI/Ollama 批量上限参考）
+#   embed_concurrency：并发嵌入批次上限（信号量），避免打爆本地 Ollama/远端 API
+#   chroma_upsert_batch：每多少条切片执行一次 bulk_insert + Chroma upsert（分批释放内存）
+EMBED_BATCH = int(os.getenv("EMBED_BATCH", _bg.get("embed_batch", 32)))
+EMBED_CONCURRENCY = int(os.getenv("EMBED_CONCURRENCY", _bg.get("embed_concurrency", 8)))
+CHROMA_UPSERT_BATCH = int(os.getenv("CHROMA_UPSERT_BATCH", _bg.get("chroma_upsert_batch", 1000)))
+
 # 向量库（chroma 本地持久化；后续可切 milvus / pgvector）
 _vector_store = _cfg.get("vector_store", {})
 VECTOR_STORE_TYPE = os.getenv("VECTOR_STORE_TYPE", _vector_store.get("type", "chroma"))

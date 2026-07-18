@@ -17,33 +17,8 @@ from datetime import datetime
 from sqlalchemy import BigInteger, String, Text, Integer, Boolean, DateTime, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy.types import TypeDecorator
 
 from models.base import Base
-
-
-class PgVectorStr(TypeDecorator):
-    """pgvector 向量列：以字符串形式存取，规避 asyncpg 自定义类型注册。
-
-    关键点：
-        1. impl=Text，ORM 侧按字符串读写；实际库列为 vector（见 V4 SQL）。
-        2. 写入将 list[float] 序列化为 '[x,y,z]'；读取反序列化为 list[float]。
-    """
-
-    impl = Text
-    cache_ok = True
-
-    def process_bind_param(self, value, dialect):
-        """入参 list[float] → pgvector 字符串字面量。"""
-        if value is None:
-            return None
-        return "[" + ",".join(str(float(x)) for x in value) + "]"
-
-    def process_result_value(self, value, dialect):
-        """出参 pgvector 字符串 → list[float]。"""
-        if value is None:
-            return None
-        return [float(x) for x in value.strip("[]").split(",") if x.strip() != ""]
 
 
 class Chunk(Base):
@@ -61,8 +36,7 @@ class Chunk(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     word_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     vector_id: Mapped[str | None] = mapped_column(String(128))
-    # 向量列：Chroma 模式下不写入（向量存于向量库），保留以便后续切回 pgvector 零改表。
-    embedding: Mapped[list | None] = mapped_column(PgVectorStr, nullable=True)
+    # 向量仅存于 Chroma（按 kb 分集合），PG 的 story_chunk 不再冗余存储向量列（Chroma-only）。
     meta: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
     disabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     extra: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)

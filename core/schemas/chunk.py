@@ -18,6 +18,7 @@ class ChunkRequest(BaseModel):
     strategy: str = Field("length", description="chapter/length")
     size: int = Field(800, gt=0, description="切片长度(字符)")
     overlap: int = Field(0, ge=0, description="重叠字符数")
+    embed_config_id: int | None = Field(None, description="指定嵌入模型配置 id（llm_type=embed）；不传则用默认分发链")
 
 
 class ChunkStrategyUpdate(BaseModel):

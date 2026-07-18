@@ -28,7 +28,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onBeforeUnmount } from 'vue'
+import { ref, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import * as echarts from 'echarts'
 import Card from '@/components/ui/Card.vue'
@@ -36,14 +36,18 @@ import Button from '@/components/ui/Button.vue'
 import Skeleton from '@/components/ui/Skeleton.vue'
 import { getGraph, extractGraph } from '@/api/graph'
 import { listNovels } from '@/api/novels'
+import { getTask } from '@/api/tasks'
 import { useToast } from '@/composables/useToast'
+import { useTaskProgressStore } from '@/stores/taskProgress'
 
 const { notify } = useToast()
+const taskStore = useTaskProgressStore()
 const route = useRoute()
 const graphEl = ref(null)
 const loading = ref(true)
 const novels = ref([])
 const currentNovel = ref(Number(route.params.id) || null)
+const myTaskId = ref(null)
 let chart = null
 
 onMounted(async () => {
@@ -109,12 +113,34 @@ function resize() {
 }
 
 async function extract() {
-  // 实现逻辑：触发后台抽取，成功/失败均弹窗提示；图谱需刷新后查看。
+  // 实现逻辑：触发后台抽取，立即弹窗提示「正在后台处理中」；全局轮询刷新进度，
+  // 本页 watcher 在任务完成时自动重载图谱。
   try {
-    await extractGraph(currentNovel.value)
-    notify('已触发实体关系抽取，请稍后刷新查看图谱。', 'success')
+    const res = await extractGraph(currentNovel.value)
+    const taskId = res.data?.task_id
+    if (!taskId) {
+      notify('已触发实体关系抽取，请稍后刷新查看图谱。', 'success')
+      return
+    }
+    myTaskId.value = taskId
+    taskStore.upsert({ id: taskId, type: 'graph', name: `小说${novels.value.find(n => n.id === currentNovel.value)?.name || '未知'}-知识图谱抽取`, progress: 0, stage: '已提交，后台处理中', status: 'running' })
+    taskStore.show()
+    notify('已提交，正在后台处理中…', 'info')
   } catch (e) {
     notify(e?.message || '抽取触发失败', 'error')
   }
 }
+
+// 监听本页抽取任务完成：由全局轮询更新 store，这里重载图谱
+watch(
+  () => taskStore.tasks.find((t) => t.id === myTaskId.value)?.status,
+  async (s) => {
+    if (s === 'success' && myTaskId.value) {
+      myTaskId.value = null
+      await loadGraph()
+    } else if (s === 'failed') {
+      myTaskId.value = null
+    }
+  }
+)
 </script>

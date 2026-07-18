@@ -39,7 +39,7 @@
           <span>{{ kb.chunk_count }} 切片</span>
           <span>{{ formatChars(kb.chars) }}</span>
         </div>
-        <p class="text-xs text-muted mt-3">更新于 {{ kb.updated_at }}</p>
+        <p class="text-xs text-muted mt-3">更新于 {{ formatDateTime(kb.updated_at) }}</p>
       </div>
     </div>
 
@@ -76,7 +76,9 @@
 
 <script setup>
 import { ref, onMounted } from 'vue'
+import { useRoute } from 'vue-router'
 import { PhDatabase } from '@phosphor-icons/vue'
+import { useToast } from '@/composables/useToast'
 import Button from '@/components/ui/Button.vue'
 import Tag from '@/components/ui/Tag.vue'
 import Skeleton from '@/components/ui/Skeleton.vue'
@@ -85,13 +87,16 @@ import Input from '@/components/ui/Input.vue'
 import EmptyState from '@/components/ui/EmptyState.vue'
 import { listKBs, createKB } from '@/api/knowledgeBases'
 import { listNovels } from '@/api/novels'
+import { formatDateTime } from '@/utils/datetime'
 
+const route = useRoute()
+const { notify } = useToast()
 const kbs = ref([])
 const novels = ref([])
 const loading = ref(true)
 const showCreate = ref(false)
 const creating = ref(false)
-const form = ref({ novel_id: 1, name: '', scope: 'full' })
+const form = ref({ novel_id: null, name: '', scope: 'full' })
 
 const scopeMap = { full: '全本', custom: '自定义' }
 const scopeText = (s) => scopeMap[s] || s
@@ -103,10 +108,17 @@ onMounted(async () => {
   const [kbRes, novelRes] = await Promise.all([listKBs(), listNovels()])
   kbs.value = kbRes.data?.list || []
   novels.value = novelRes.data?.list || []
+  // 优先用入口携带的小说 id（如从小说详情「建知识库」带参进入），否则默认第一个
+  const qid = Number(route.query.novel_id)
+  form.value.novel_id = (novels.value.find((n) => n.id === qid) ? qid : null) || novels.value[0]?.id || null
   loading.value = false
 })
 
 async function submit() {
+  if (!form.value.novel_id) {
+    notify('请先选择关联小说', 'error')
+    return
+  }
   creating.value = true
   const res = await createKB({ ...form.value })
   if (res.code === 0) {
@@ -119,10 +131,10 @@ async function submit() {
       doc_count: 0,
       chunk_count: 0,
       chars: 0,
-      updated_at: '2026-07-16'
+      updated_at: res.data?.updated_at || new Date().toISOString()
     })
     showCreate.value = false
-    form.value = { novel_id: 1, name: '', scope: 'full' }
+    form.value = { novel_id: novels.value[0]?.id || null, name: '', scope: 'full' }
   }
   creating.value = false
 }

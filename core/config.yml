@@ -6,6 +6,15 @@
 database:
   dsn: "postgresql+asyncpg://postgres:root@localhost:5432/story_rag"
 
+# 线程池配置
+background:
+  thread_pool_size: 20
+  task_timeout: 300
+  # 切片嵌入/落库并发与批大小（Chroma-only 流式分批）
+  embed_batch: 32                 # 单次嵌入请求携带的文本条数
+  embed_concurrency: 8            # 并发嵌入批次上限（信号量）
+  chroma_upsert_batch: 1000        # 每多少条切片执行一次 bulk_insert + Chroma upsert
+
 # JWT 鉴权
 jwt:
   secret: "story-rag-dev-secret-change-me"

@@ -69,7 +69,7 @@ async def _load_novel(session: AsyncSession, owner_id: int, novel_id: int) -> No
 
 async def _collect_chapters_text(session: AsyncSession, novel_id: int, max_total: int) -> str:
     """拼接章节正文（按章号顺序），截断到 max_total 字。"""
-    chapters: list[Chapter] = await novel_repo.list_chapters(session, novel_id)
+    chapters: list[Chapter] = await novel_repo.list_all_chapters(session, novel_id)
     if not chapters:
         return ""
     parts, total = [], 0
@@ -92,7 +92,7 @@ async def _build_context(session: AsyncSession, novel_id: int, chapter_id: int |
             raise BizError(404, "指定章节不存在")
         text = ch.content
     else:
-        chapters: list[Chapter] = await novel_repo.list_chapters(session, novel_id)
+        chapters: list[Chapter] = await novel_repo.list_all_chapters(session, novel_id)
         if not chapters:
             raise BizError(400, "该小说暂无章节，无法续写")
         text = chapters[-1].content
@@ -247,7 +247,7 @@ async def adopt_as_chapter(session: AsyncSession, owner_id: int, version_id: int
     version = await writing_repo.get_version(session, owner_id, version_id)
     if not version:
         raise BizError(404, "续写版本不存在或无权限")
-    chapters: list[Chapter] = await novel_repo.list_chapters(session, version.novel_id)
+    chapters: list[Chapter] = await novel_repo.list_all_chapters(session, version.novel_id)
     next_no = (max((c.chapter_no for c in chapters), default=0) + 1) if chapters else 1
     style_label = {"original": "原风格", "tense": "悬疑", "warm": "温情"}.get(version.style, version.style)
     new_chapter = Chapter(

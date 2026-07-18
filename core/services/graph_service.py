@@ -16,11 +16,12 @@
 """
 import json
 
+from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.graph import Entity, Relation
 from repositories import graph_repo, novel_repo, llm_repo
-from services import llm_adapters
+from services import llm_adapters, task_service
 from common import crypto
 from common.exceptions import BizError
 
@@ -81,7 +82,7 @@ async def list_relation_types(session: AsyncSession, owner_id: int) -> list:
 
 async def extract(session: AsyncSession, novel_id: int, owner_id: int) -> dict:
     """实体关系抽取（M5.2）：LLM 抽取并幂等落库，返回新增统计。"""
-    chapters = await novel_repo.list_chapters(session, novel_id)
+    chapters = await novel_repo.list_all_chapters(session, novel_id)
     if not chapters:
         raise BizError(400, "该小说暂无章节，无法抽取")
     text = "\n".join(c.content for c in chapters)[:12000]
@@ -128,14 +129,23 @@ async def extract(session: AsyncSession, novel_id: int, owner_id: int) -> dict:
     return {"entity_count": ent_count, "relation_count": rel_count}
 
 
-async def run_extract(novel_id: int, owner_id: int) -> None:
-    """后台抽取入口：自开会话调用 extract，异常仅记录不抛出。"""
+async def run_extract(novel_id: int, owner_id: int, task_id: int | None = None) -> None:
+    """后台抽取入口：自开会话调用 extract，进度回写统一任务，异常仅记录不抛出。"""
     from db import SessionLocal
     async with SessionLocal() as session:
         try:
+            if task_id:
+                await task_service.update_task_progress(task_id, stage="extracting", progress=20, status="running", started_at=datetime.now(timezone.utc))
             result = await extract(session, novel_id, owner_id)
+            if task_id:
+                await task_service.update_task_progress(
+                    task_id, stage="done", progress=100, status="success", finished_at=datetime.now(timezone.utc),
+                    entity_count=result.get("entity_count", 0), relation_count=result.get("relation_count", 0),
+                )
             print(f"[graph] 抽取完成 novel={novel_id} {result}")
         except Exception as e:  # 后台任务异常不应影响主流程
+            if task_id:
+                await task_service.update_task_progress(task_id, stage="failed", status="failed", error=str(e), finished_at=datetime.now(timezone.utc))
             print(f"[graph] 抽取失败 novel={novel_id}: {e}")
 
 

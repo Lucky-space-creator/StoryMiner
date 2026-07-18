@@ -14,12 +14,13 @@
 """
 from datetime import datetime, timezone
 
-from sqlalchemy import select, func, update
+from sqlalchemy import select, func, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.novel_content import (
-    Novel, Chapter, Document, ParseTask, KnowledgeBase,
+    Novel, Chapter, Document, ParseTask, KnowledgeBase, KbDocument,
 )
+from models.chunk import Chunk
 
 
 async def create_novel(session: AsyncSession, novel: Novel) -> Novel:
@@ -47,9 +48,24 @@ async def get_novel(session: AsyncSession, owner_id: int, novel_id: int) -> Nove
     return None
 
 
-async def soft_delete_novel(session: AsyncSession, novel: Novel) -> None:
-    """逻辑删除小说。"""
-    novel.deleted_at = datetime.now(timezone.utc)
+async def hard_delete_novel(session: AsyncSession, novel_id: int) -> None:
+    """物理删除小说及其全部从属数据（章节/文档/知识库/切片/解析任务/关联）。"""
+    await session.execute(delete(Chapter).where(Chapter.novel_id == novel_id))
+    await session.execute(delete(KbDocument).where(
+        KbDocument.doc_id.in_(select(Document.id).where(Document.novel_id == novel_id))
+    ))
+    # 先清解析任务（story_parse_task.doc_id 外键引用 document），否则删文档外键冲突
+    await session.execute(delete(ParseTask).where(
+        ParseTask.doc_id.in_(select(Document.id).where(Document.novel_id == novel_id))
+    ))
+    await session.execute(delete(Document).where(Document.novel_id == novel_id))
+    await session.execute(delete(Chunk).where(Chunk.novel_id == novel_id))
+    await session.execute(delete(KbDocument).where(
+        KbDocument.kb_id.in_(select(KnowledgeBase.id).where(KnowledgeBase.novel_id == novel_id))
+    ))
+    await session.execute(delete(KnowledgeBase).where(KnowledgeBase.novel_id == novel_id))
+    await session.execute(delete(ParseTask).where(ParseTask.novel_id == novel_id))
+    await session.execute(delete(Novel).where(Novel.id == novel_id))
 
 
 async def count_chapters(session: AsyncSession, novel_id: int) -> int:
@@ -74,6 +90,19 @@ async def list_chapters(session: AsyncSession, novel_id: int, page: int = 1, siz
     return list(res.scalars().all()), total
 
 
+async def list_all_chapters(session: AsyncSession, novel_id: int) -> list[Chapter]:
+    """返回小说下全部未删除章节（按章节号、ID 排序），供 AI 分析/概括拼接全文使用。
+
+    关键点：
+        1. 返回扁平 list[Chapter]，非分页元组，避免调用方误把 (list,total) 当列表迭代。
+        2. 不限制条数，确保人物分析/AI 概括能覆盖完整正文。
+    """
+    stmt = select(Chapter).where(
+        Chapter.novel_id == novel_id, Chapter.deleted_at.is_(None)
+    ).order_by(Chapter.chapter_no, Chapter.id)
+    return list((await session.execute(stmt)).scalars().all())
+
+
 async def get_chapter(session: AsyncSession, chapter_id: int) -> Chapter | None:
     """按 ID 查询章节（含已删除，归属由 service 校验）。"""
     return await session.get(Chapter, chapter_id)
@@ -85,13 +114,10 @@ async def add_chapters(session: AsyncSession, chapters: list[Chapter]) -> None:
     await session.flush()
 
 
-async def soft_delete_chapters(session: AsyncSession, ids: list[int]) -> None:
-    """批量逻辑删除章节。"""
-    await session.execute(
-        update(Chapter)
-        .where(Chapter.id.in_(ids))
-        .values(deleted_at=datetime.now(timezone.utc))
-    )
+async def hard_delete_chapters(session: AsyncSession, ids: list[int]) -> None:
+    """物理删除章节（合并时移除被并入的章节）。"""
+    if ids:
+        await session.execute(delete(Chapter).where(Chapter.id.in_(ids)))
 
 
 async def create_document(session: AsyncSession, doc: Document) -> Document:
@@ -135,7 +161,7 @@ async def list_parse_tasks(session: AsyncSession, owner_id: int) -> list[ParseTa
 
 
 async def get_or_create_default_kb(session: AsyncSession, novel_id: int, owner_id: int) -> KnowledgeBase:
-    """获取或创建小说默认知识库「正文库」（满足 document.kb_id 约束）。"""
+    """获取或创建小说默认知识库「正文库」（方案A 前兼容：新上传文档 kb_id 已可空，此方法保留备用）。"""
     stmt = select(KnowledgeBase).where(
         KnowledgeBase.novel_id == novel_id,
         KnowledgeBase.name == "正文库",
@@ -148,3 +174,15 @@ async def get_or_create_default_kb(session: AsyncSession, novel_id: int, owner_i
     session.add(kb)
     await session.flush()
     return kb
+
+
+async def list_documents_by_novel(session: AsyncSession, novel_id: int, page: int, size: int):
+    """分页查询小说下全部文档（方案A：文档归属小说，供详情页 CRUD 与构建选文件）。"""
+    base = select(Document).where(
+        Document.novel_id == novel_id, Document.deleted_at.is_(None)
+    )
+    total = (await session.execute(select(func.count()).select_from(base.subquery()))).scalar() or 0
+    res = await session.execute(
+        base.order_by(Document.id.desc()).limit(size).offset((page - 1) * size)
+    )
+    return res.scalars().all(), total

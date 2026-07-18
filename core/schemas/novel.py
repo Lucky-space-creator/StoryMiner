@@ -41,6 +41,7 @@ class NovelOut(BaseModel):
     name: str
     author: str | None = None
     summary: str | None = None
+    ai_summary: str | None = None
     description: str | None = None
     cover: str | None = None
     status: str

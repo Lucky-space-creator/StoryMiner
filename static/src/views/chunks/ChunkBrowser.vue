@@ -14,7 +14,14 @@
         <option value="">全部知识库</option>
         <option v-for="kb in kbs" :key="kb.id" :value="kb.id">{{ kb.name }}</option>
       </select>
-      <Input v-model="filters.chapter_id" placeholder="章节，如：第1章" class="w-44" @keyup.enter="load" />
+      <input
+        v-model.number="filters.chapter_id"
+        type="number"
+        min="1"
+        placeholder="章节ID（数字）"
+        class="bg-surface border border-app rounded-[var(--radius-sm)] px-3 py-2 text-sm text-app outline-none focus:ring-2 ring-accent w-44"
+        @keyup.enter="load"
+      />
       <label class="flex items-center gap-2 text-sm text-muted">
         <input type="checkbox" v-model="filters.onlyDisabled" @change="load" class="accent-[var(--accent)]" />
         仅看已屏蔽

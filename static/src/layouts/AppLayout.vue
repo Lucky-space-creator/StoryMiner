@@ -61,9 +61,12 @@
 </template>
 
 <script setup>
+import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useUserStore } from '@/stores/user'
 import { useThemeStore } from '@/stores/theme'
+import { listNovels } from '@/api/novels'
+import { useTaskPoller } from '@/composables/useTaskPoller'
 import {
   PhBookOpen, PhSignOut, PhSun, PhMoon,
   PhGauge, PhBooks, PhDatabase, PhParagraph,
@@ -77,12 +80,25 @@ const router = useRouter()
 const user = useUserStore()
 const theme = useThemeStore()
 
+// 全局异步任务轮询：每 5s 拉取进行中任务刷新悬浮窗/仪表盘，并在完成时弹窗通知
+useTaskPoller(5000)
+
+// 动态取第一个小说，供「知识图谱/人物档案」导航使用，避免写死 id=1 跳到不存在的小说
+const novels = ref([])
+const firstNovelId = computed(() => novels.value[0]?.id)
+onMounted(async () => {
+  try {
+    const res = await listNovels()
+    novels.value = res.data?.list || []
+  } catch {}
+})
+
 function logout() {
   user.logout()
   router.push('/login')
 }
 
-const nav = [
+const nav = computed(() => [
   { title: '工作台', items: [{ to: '/dashboard', label: '仪表盘', icon: PhGauge }] },
   {
     title: '内容',
@@ -95,8 +111,8 @@ const nav = [
   {
     title: '智能',
     items: [
-      { to: '/novels/1/graph', label: '知识图谱', icon: PhGraph },
-      { to: '/novels/1/characters', label: '人物档案', icon: PhUsers },
+      { to: firstNovelId.value ? `/novels/${firstNovelId.value}/graph` : '/novels', label: '知识图谱', icon: PhGraph },
+      { to: firstNovelId.value ? `/novels/${firstNovelId.value}/characters` : '/novels', label: '人物档案', icon: PhUsers },
       { to: '/conversations', label: '角色对话', icon: PhChatsCircle },
       { to: '/writing', label: '续写与概览', icon: PhPenNib }
     ]
@@ -111,5 +127,5 @@ const nav = [
       { to: '/explore', label: '扩展', icon: PhCompass }
     ]
   }
-]
+])
 </script>

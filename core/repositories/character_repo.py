@@ -12,7 +12,7 @@
 实现逻辑：
     基于 async session 的 select/update；写入后 flush 取回自增 ID，调用方统一提交。
 """
-from sqlalchemy import select, update
+from sqlalchemy import select, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.character import Character
@@ -48,11 +48,6 @@ async def create(session: AsyncSession, c: Character) -> Character:
     return c
 
 
-async def soft_delete(session: AsyncSession, char_id: int) -> None:
-    """逻辑删除人物。"""
-    from datetime import datetime, timezone
-    await session.execute(
-        update(Character)
-        .where(Character.id == char_id)
-        .values(deleted_at=datetime.now(timezone.utc))
-    )
+async def hard_delete(session: AsyncSession, char_id: int) -> None:
+    """物理删除人物。"""
+    await session.execute(delete(Character).where(Character.id == char_id))

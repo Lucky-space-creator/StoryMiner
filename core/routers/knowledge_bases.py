@@ -12,8 +12,6 @@
 实现逻辑：
     委托 kb_service；导出用 Response/JSONResponse 直接下发文件内容。
 """
-import uuid
-
 from fastapi import APIRouter, Depends, UploadFile, BackgroundTasks, Query
 from fastapi.responses import Response, JSONResponse
 
@@ -21,9 +19,11 @@ from models.user import User
 from db import get_session
 from auth.jwt import get_current_user
 from common.response import success, paginate
-from schemas.knowledge_base import KBCreate, KBUpdate
+from common.exceptions import BizError
+from schemas.knowledge_base import KBCreate, KBUpdate, BuildRequest
 from schemas.chunk import ChunkRequest
-from services import kb_service, chunk_service
+from services import kb_service, chunk_service, task_service
+from repositories import novel_repo, kb_repo
 
 router = APIRouter(prefix="/knowledge-bases", tags=["knowledge-bases"])
 
@@ -113,7 +113,8 @@ async def export_kb(
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     if format == "csv":
         return Response(content=content, media_type=media_type, headers=headers)
-    return JSONResponse(content=content, headers=headers)
+    # JSON 导出按统一信封返回，前端拦截器依赖 {code,msg,data}
+    return success(content)
 
 
 @router.post("/{kb_id}/chunk")
@@ -122,22 +123,38 @@ async def chunk_kb(
     background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user), session=Depends(get_session),
 ):
-    """触发切割+向量化（M3.1）：后台任务执行，立即返回 task_id 供前端轮询进度。"""
-    task_id = str(uuid.uuid4())
-    background_tasks.add_task(chunk_service.chunk_and_index_async, user.id, kb_id, data, False, task_id)
-    return success({"task_id": task_id}, "已启动切割")
+    """触发切割+向量化（M3.1）：后台任务执行，立即返回统一 task_id 供前端轮询进度。
+
+    关键点：触发前自动将小说下所有已解析完成的文档纳入该知识库（幂等，已纳入则跳过），
+    避免因文档未纳管导致构建成功但切片为 0 的问题。
+    """
+    kb = await kb_repo.get_kb(session, user.id, kb_id)
+    if not kb:
+        raise BizError(404, "知识库不存在")
+    # 自动将小说下所有已解析完成（status=done）的文档纳入该知识库（幂等）
+    await kb_service.ensure_docs_in_kb(session, user.id, kb.novel_id, kb_id)
+    await session.commit()
+    novel = await novel_repo.get_novel(session, user.id, kb.novel_id)
+    novel_name = novel.name if novel else f"知识库{kb_id}"
+    task = await task_service.create_task(session, user.id, "chunk", f"小说{novel_name}-构建索引", novel_id=kb.novel_id, kb_id=kb_id, extra={"mode": "full"})
+    background_tasks.add_task(chunk_service.chunk_and_index_async, user.id, kb_id, data, False, task.id)
+    return success({"task_id": task.id}, "已启动切割")
 
 
-@router.get("/{kb_id}/chunk-progress")
-async def chunk_progress(
-    kb_id: int, task_id: str = Query(...),
+@router.post("/{kb_id}/build")
+async def build_kb(
+    kb_id: int, data: BuildRequest,
+    background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user), session=Depends(get_session),
 ):
-    """切割进度查询（M3.1 配套）：按 task_id 返回进度/阶段/状态。"""
-    prog = chunk_service.get_chunk_progress(task_id)
-    if not prog:
-        raise BizError(404, "任务不存在或已过期")
-    return success(prog)
+    """构建索引（方案A：单选文档）：校验并将文档纳入知识库，后台切分向量化该文档。"""
+    await kb_service.add_document_to_kb(session, user.id, kb_id, data.doc_id)
+    kb = await kb_repo.get_kb(session, user.id, kb_id)
+    novel = await novel_repo.get_novel(session, user.id, kb.novel_id)
+    novel_name = novel.name if novel else f"知识库{kb_id}"
+    task = await task_service.create_task(session, user.id, "chunk", f"小说{novel_name}-构建索引", novel_id=kb.novel_id, kb_id=kb_id, doc_id=data.doc_id, extra={"mode": "build"})
+    background_tasks.add_task(chunk_service.build_doc_async, user.id, kb_id, data.doc_id, data, task.id)
+    return success({"task_id": task.id}, "已启动构建")
 
 
 @router.put("/{kb_id}/chunk-strategy")
@@ -152,10 +169,25 @@ async def update_chunk_strategy(
 @router.post("/{kb_id}/reindex")
 async def reindex(
     kb_id: int, data: ChunkRequest,
+    background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user), session=Depends(get_session),
 ):
-    """全量重切重建索引（M3.3）：清空旧切片后重新切割向量化。"""
-    return success(await chunk_service.chunk_and_index(session, user.id, kb_id, data, full=True), "重建完成")
+    """全量重切重建索引（M3.3）：后台任务执行，立即返回统一 task_id 供前端轮询进度。
+
+    关键点：触发前自动将小说下所有已解析完成的文档纳入该知识库（幂等，已纳入则跳过），
+    避免因文档未纳管导致重建成功但切片为 0 的问题。
+    """
+    kb = await kb_repo.get_kb(session, user.id, kb_id)
+    if not kb:
+        raise BizError(404, "知识库不存在")
+    # 自动将小说下所有已解析完成（status=done）的文档纳入该知识库（幂等）
+    await kb_service.ensure_docs_in_kb(session, user.id, kb.novel_id, kb_id)
+    await session.commit()
+    novel = await novel_repo.get_novel(session, user.id, kb.novel_id)
+    novel_name = novel.name if novel else f"知识库{kb_id}"
+    task = await task_service.create_task(session, user.id, "chunk", f"小说{novel_name}-重建索引", novel_id=kb.novel_id, kb_id=kb_id, extra={"mode": "full"})
+    background_tasks.add_task(chunk_service.chunk_and_index_async, user.id, kb_id, data, True, task.id)
+    return success({"task_id": task.id}, "已启动重建")
 
 
 @router.post("/{kb_id}/incremental-index")

@@ -62,8 +62,8 @@ async def chat_ws(websocket: WebSocket, conv_id: int, token: str = Query(...)):
                 await websocket.send_json({"type": "done"})
             except BizError as e:
                 await websocket.send_json({"type": "error", "content": e.msg})
-            except Exception as e:  # noqa: BLE001 兜底，避免连接整体崩溃
-                await websocket.send_json({"type": "error", "content": str(e) or "对话生成失败"})
+            except Exception:  # noqa: BLE001 兜底，避免连接整体崩溃；不向客户端泄露内部异常细节
+                await websocket.send_json({"type": "error", "content": "对话生成失败，请稍后重试"})
     except WebSocketDisconnect:
         pass
     finally:

@@ -89,7 +89,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { PhTrash } from '@phosphor-icons/vue'
 import Tag from '@/components/ui/Tag.vue'
@@ -101,9 +101,12 @@ import Input from '@/components/ui/Input.vue'
 import ConfirmDialog from '@/components/ui/ConfirmDialog.vue'
 import { listCharacters, getCharacter, createCharacter, deleteCharacter, generateCharacter } from '@/api/characters'
 import { listNovels } from '@/api/novels'
+import { getTask } from '@/api/tasks'
 import { useToast } from '@/composables/useToast'
+import { useTaskProgressStore } from '@/stores/taskProgress'
 
 const { notify } = useToast()
+const taskStore = useTaskProgressStore()
 const novels = ref([])
 const characters = ref([])
 const loading = ref(true)
@@ -115,6 +118,7 @@ const adding = ref(false)
 const form = ref({ name: '', role: '主角', desc: '' })
 const delOpen = ref(false)
 const pending = ref(null)
+const myTaskId = ref(null)
 
 onMounted(async () => {
   const res = await listNovels()
@@ -138,16 +142,40 @@ async function open(c) {
 }
 
 async function generate() {
-  // 实现逻辑：调用后端 AI 生成小传接口，成功刷新当前人物卡，失败弹错误提示。
+  // 实现逻辑：触发后台生成小传，立即弹窗提示「正在后台处理中」；全局轮询刷新进度，
+  // 本页 watcher 在任务完成时刷新当前人物卡（若抽屉打开）。
   if (!current.value) return
   try {
     const res = await generateCharacter(current.value.id)
-    current.value = res.data || current.value
-    notify('已生成人物小传', 'success')
+    const taskId = res.data?.task_id
+    if (!taskId) {
+      const r = await getCharacter(current.value.id)
+      current.value = r.data || current.value
+      notify('已生成人物小传', 'success')
+      return
+    }
+    myTaskId.value = taskId
+    taskStore.upsert({ id: taskId, type: 'character', name: `小说${novels.value.find(n => n.id === currentNovel.value)?.name || '未知'}-人物抽取实体`, progress: 0, stage: '已提交，后台处理中', status: 'running' })
+    taskStore.show()
+    notify('已提交，正在后台处理中…', 'info')
   } catch (e) {
     notify(e?.message || '生成失败', 'error')
   }
 }
+
+// 监听本页生成任务完成：由全局轮询更新 store，这里刷新当前人物卡
+watch(
+  () => taskStore.tasks.find((t) => t.id === myTaskId.value)?.status,
+  async (s) => {
+    if (s === 'success' && myTaskId.value && current.value) {
+      myTaskId.value = null
+      const r = await getCharacter(current.value.id)
+      current.value = r.data || current.value
+    } else if (s === 'failed') {
+      myTaskId.value = null
+    }
+  }
+)
 
 function openCreate() {
   form.value = { name: '', role: '主角', desc: '' }

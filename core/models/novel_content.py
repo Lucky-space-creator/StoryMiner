@@ -8,6 +8,8 @@
     1. 表名严格为 story_novel / story_chapter / story_document / story_parse_task / story_knowledge_base。
     2. 所有写操作均带 owner_id 实现隔离；逻辑删除用 deleted_at。
     3. 文档/任务状态机字段对齐 API 契约（pending/parsing/.../done/failed）。
+    4. 方案A：文档与知识库解耦，Document.kb_id 可空（文档归属小说）；
+       知识库通过 story_kb_document 链接表关联文档，支持一份文档纳入多个库。
 
 实现逻辑：
     声明式映射；JSONB 字段用 dict；时间字段用带时区 DateTime，服务端默认 now()。
@@ -31,6 +33,8 @@ class Novel(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     author: Mapped[str | None] = mapped_column(String(128))
     summary: Mapped[str | None] = mapped_column(Text)
+    # AI 生成的小说概括（≤200字，含主人公与大体情节），由异步任务在文档解析完成后回写
+    ai_summary: Mapped[str | None] = mapped_column(Text)
     description: Mapped[str | None] = mapped_column(Text)
     cover: Mapped[str | None] = mapped_column(String(512))
     status: Mapped[str] = mapped_column(String(16), default="serial", nullable=False)
@@ -82,12 +86,13 @@ class KnowledgeBase(Base):
 
 
 class Document(Base):
-    """文档：上传原文，解析前 pending，解析后 done。"""
+    """文档：上传原文，解析前 pending，解析后 done。方案A 下仅归属小说，kb_id 可空。"""
 
     __tablename__ = "story_document"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    kb_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # 方案A：文档解耦知识库，kb_id 可空；文档归属小说，知识库关联走 story_kb_document 链接表。
+    kb_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     novel_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     owner_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -120,4 +125,15 @@ class ParseTask(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     extra: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class KbDocument(Base):
+    """知识库-文档关联（方案A）：链接表，一份文档可纳入多个知识库参与构建。"""
+
+    __tablename__ = "story_kb_document"
+
+    kb_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    doc_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    owner_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

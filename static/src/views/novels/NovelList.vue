@@ -82,7 +82,20 @@
           </div>
         </div>
 
-        <p class="text-xs text-muted">创建后可进入详情页上传文档（TXT≤50MB，EPUB/PDF/DOCX≤200MB）并自动解析切章。</p>
+        <div>
+          <label class="block text-sm text-app mb-1.5">上传文档（可选，可多选）</label>
+          <input ref="docsEl" type="file" accept=".txt,.epub,.pdf,.docx" multiple class="hidden" @change="onDocs" />
+          <div class="flex flex-wrap items-center gap-2">
+            <Button variant="secondary" size="sm" type="button" @click="docsEl?.click()">选择文件</Button>
+            <span
+              v-for="f in form.files"
+              :key="f.name"
+              class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs bg-surface2 text-app"
+            >{{ f.name }}</span>
+          </div>
+        </div>
+
+        <p class="text-xs text-muted">创建后文档将自动解析切章；进入详情页可继续上传或构建知识库索引。</p>
         <div class="flex justify-end gap-2">
           <Button variant="ghost" type="button" @click="showUpload = false">取消</Button>
           <Button type="submit" :loading="uploading">创建</Button>
@@ -103,7 +116,7 @@ import Skeleton from '@/components/ui/Skeleton.vue'
 import Modal from '@/components/ui/Modal.vue'
 import Input from '@/components/ui/Input.vue'
 import ConfirmDialog from '@/components/ui/ConfirmDialog.vue'
-import { listNovels, createNovel, deleteNovel } from '@/api/novels'
+import { listNovels, createNovel, deleteNovel, uploadDocuments } from '@/api/novels'
 import { useToast } from '@/composables/useToast'
 
 const { notify } = useToast()
@@ -114,7 +127,8 @@ const uploading = ref(false)
 const defaultTags = ref(['仙侠', '江湖', '克苏鲁', '蒸汽朋克', '修仙', '凡人流', '玄幻', '都市', '科幻', '悬疑'])
 const customTag = ref('')
 const fileEl = ref(null)
-const form = ref({ name: '', author: '', summary: '', cover: '', tags: [] })
+const docsEl = ref(null)
+const form = ref({ name: '', author: '', summary: '', cover: '', tags: [], files: [] })
 
 const delOpen = ref(false)
 const pending = ref(null)
@@ -123,8 +137,14 @@ const statusMap = { done: '已完成', parsing: '解析中', pending: '待解析
 function statusText(s) { return statusMap[s] || s }
 
 function openUpload() {
-  form.value = { name: '', author: '', summary: '', cover: '', tags: [] }
+  form.value = { name: '', author: '', summary: '', cover: '', tags: [], files: [] }
   showUpload.value = true
+}
+
+function onDocs(e) {
+  const files = Array.from(e.target.files || [])
+  form.value.files = files
+  if (docsEl.value) docsEl.value.value = ''
 }
 
 function onCover(e) {
@@ -180,10 +200,20 @@ onMounted(async () => {
 async function submitUpload() {
   uploading.value = true
   try {
-    const res = await createNovel({ ...form.value })
+    const res = await createNovel({
+      name: form.value.name,
+      author: form.value.author,
+      summary: form.value.summary,
+      cover: form.value.cover,
+      tags: form.value.tags,
+    })
+    const novelId = res.data.id
+    if (form.value.files && form.value.files.length) {
+      await uploadDocuments(novelId, form.value.files)
+    }
     novels.value.unshift(res.data)
     showUpload.value = false
-    notify('小说创建成功', 'success')
+    notify('小说创建成功' + (form.value.files.length ? '，文档解析中' : ''), 'success')
   } catch (e) {
     notify(e.message || '创建失败', 'error')
   } finally {

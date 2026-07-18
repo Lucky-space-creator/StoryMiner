@@ -41,6 +41,7 @@ from routers import ws_write as ws_write_router
 from routers import skills as skills_router
 from routers import extension as extension_router
 from routers import dashboard as dashboard_router
+from routers import task_router as task_router
 from services import skill_service
 
 
@@ -55,6 +56,30 @@ async def lifespan(app: FastAPI):
             await conn.execute(text("ALTER TABLE story_skill ALTER COLUMN owner_id DROP NOT NULL"))
         except Exception:
             pass
+        # 方案A：文档与知识库解耦，kb_id 改为可空（create_all 不会改列约束，需显式 ALTER）
+        try:
+            from sqlalchemy import text
+            await conn.execute(text("ALTER TABLE story_document ALTER COLUMN kb_id DROP NOT NULL"))
+        except Exception:
+            pass
+        # 迁移历史数据：原 kb_id 非空的文档建立关联（幂等，重复执行忽略）
+        try:
+            from sqlalchemy import text
+            await conn.execute(text(
+                "INSERT INTO story_kb_document (kb_id, doc_id, owner_id, created_at) "
+                "SELECT kb_id, id, owner_id, created_at FROM story_document "
+                "WHERE kb_id IS NOT NULL AND deleted_at IS NULL "
+                "ON CONFLICT (kb_id, doc_id) DO NOTHING"
+            ))
+        except Exception:
+            pass
+        # V10：AI 概括字段（story_novel.ai_summary）。create_all 不会给已存在的表加列，
+        # 模型已使用该字段，缺失会致 /api/v1/novels 等接口 500，故显式 ALTER 补齐（幂等）。
+        try:
+            from sqlalchemy import text
+            await conn.execute(text("ALTER TABLE story_novel ADD COLUMN IF NOT EXISTS ai_summary TEXT"))
+        except Exception:
+            pass
     async with SessionLocal() as s:
         await skill_service.seed_builtin(s)
     # 确保对象存储桶存在（MinIO 后端；失败仅告警不阻断启动）
@@ -64,6 +89,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:  # noqa: BLE001
         print("[warn] 存储初始化失败:", e)
     yield
+    # 进程退出时优雅关闭后台线程池，避免线程悬挂
+    try:
+        from common.threadpool import shutdown
+        shutdown()
+    except Exception:
+        pass
 
 
 app = FastAPI(title="小说解析 RAG 系统", version="v1", lifespan=lifespan)
@@ -108,6 +139,7 @@ app.include_router(ws_write_router.ws_router)
 app.include_router(skills_router.router, prefix="/api/v1")
 app.include_router(extension_router.router, prefix="/api/v1")
 app.include_router(dashboard_router.router, prefix="/api/v1")
+app.include_router(task_router.router, prefix="/api/v1")
 
 
 @app.get("/")

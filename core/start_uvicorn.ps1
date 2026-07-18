@@ -1,1 +1,0 @@
-Start-Process -FilePath 'e:\AI_Pro\RAG_Pro\pythonProject\.venv\Scripts\python.exe' -ArgumentList '-m','uvicorn','main:app','--host','0.0.0.0','--port','8000' -RedirectStandardOutput 'uvicorn.out.log' -RedirectStandardError 'uvicorn.err.log' -WorkingDirectory 'e:\AI_Pro\RAG_Pro\pythonProject\core'

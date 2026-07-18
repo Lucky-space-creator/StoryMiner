@@ -20,7 +20,7 @@ from db import get_session
 from auth.jwt import get_current_user
 from common.response import success
 from common.exceptions import BizError
-from services import graph_service
+from services import graph_service, task_service
 from repositories import novel_repo
 
 # 图谱与抽取：与小说资源同域，挂在 /novels 下
@@ -48,12 +48,13 @@ async def extract_graph(
     user: User = Depends(get_current_user),
     session=Depends(get_session),
 ):
-    """实体关系抽取（M5.2）：后台调用 LLM 抽取并落库，接口立即返回。"""
+    """实体关系抽取（M5.2）：后台调用 LLM 抽取并落库，接口立即返回统一 task_id。"""
     novel = await novel_repo.get_novel(session, user.id, novel_id)
     if not novel:
         raise BizError(404, "小说不存在")
-    background_tasks.add_task(graph_service.run_extract, novel_id, user.id)
-    return success({"status": "started"}, "已在后台抽取实体关系，稍后刷新查看")
+    task = await task_service.create_task(session, user.id, "graph", f"小说{novel.name}-知识图谱抽取", novel_id=novel_id)
+    background_tasks.add_task(graph_service.run_extract, novel_id, user.id, task.id)
+    return success({"task_id": task.id}, "已启动实体关系抽取")
 
 
 @rt_router.get("/relation-types")

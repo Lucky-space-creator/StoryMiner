@@ -14,14 +14,20 @@
     CRUD 校验归属后委托 character_repo；generate 拼文本→调 chat→容错解析 JSON→更新字段。
 """
 import json
+import logging
+import time
+import traceback
 
+from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.character import Character
 from repositories import character_repo, novel_repo, llm_repo
-from services import llm_adapters
+from services import llm_adapters, task_service
 from common import crypto
 from common.exceptions import BizError
+
+logger = logging.getLogger(__name__)
 
 # 前端展示字段映射：列表项仅需 name/role/desc/appearances
 _LIST_FIELDS = ("id", "name", "role", "description", "appearances")
@@ -101,11 +107,11 @@ async def update_character(session: AsyncSession, char_id: int, owner_id: int, p
 
 
 async def delete_character(session: AsyncSession, char_id: int, owner_id: int) -> None:
-    """删除人物（软删除）。"""
+    """删除人物（物理删除）。"""
     c = await character_repo.get(session, char_id)
-    if not c or c.owner_id != owner_id or c.deleted_at is not None:
+    if not c or c.owner_id != owner_id:
         raise BizError(404, "人物不存在")
-    await character_repo.soft_delete(session, char_id)
+    await character_repo.hard_delete(session, char_id)
     await session.commit()
 
 
@@ -126,19 +132,44 @@ _GEN_PROMPT = """你是小说人物小传撰写助手，请基于给定文本为
 {text}"""
 
 
-async def generate_profile(session: AsyncSession, char_id: int, owner_id: int) -> dict:
-    """AI 生成小传（M6.2）：基于全文生成结构化档案并写回。"""
+async def generate_profile(session: AsyncSession, char_id: int, owner_id: int, task_id: int | None = None) -> dict:
+    """AI 生成小传（M6.2）：基于全文分片流式生成结构化档案并写回。
+
+    改进点：
+        1. 正文超长时按分片处理，突破单 prompt 1.2 万字截断，覆盖完整全文。
+        2. 流式调用逐片回写进度（30→90）。
+        3. 多分片小传按字段合并（description 取最长）。
+    """
     c = await character_repo.get(session, char_id)
     if not c or c.owner_id != owner_id or c.deleted_at is not None:
         raise BizError(404, "人物不存在")
-    chapters = await novel_repo.list_chapters(session, c.novel_id)
+    chapters = await novel_repo.list_all_chapters(session, c.novel_id)
     if not chapters:
         raise BizError(400, "该小说暂无章节，无法生成小传")
-    text = "\n".join(ch.content for ch in chapters)[:12000]
-    adapter, _ = await _get_chat_adapter(session, owner_id)
-    raw = await adapter.chat([{"role": "user", "content": _GEN_PROMPT.replace("{name}", c.name).replace("{text}", text)}])
-    data = _parse_json(raw)
-
+    full_text = "\n".join(ch.content for ch in chapters)
+    chunks = _chunk_text(full_text) or [""]
+    adapter, model_name = await _get_chat_adapter(session, owner_id)
+    cfgs = await llm_repo.list_for_dispatch(session, owner_id, "chat")
+    config_id = cfgs[0].id if cfgs else None
+    profiles: list[dict] = []
+    tok_in = tok_out = 0
+    n = len(chunks)
+    for i, chunk in enumerate(chunks):
+        prompt = _GEN_PROMPT.replace("{name}", c.name).replace("{text}", chunk)
+        lo = 30 + int(i / n * 60)   # 进度区间：30 → 90
+        hi = 30 + int((i + 1) / n * 60)
+        raw = await _stream_collect(
+            adapter, [{"role": "user", "content": prompt}], task_id,
+            lo=lo, hi=hi, stage="generating", temperature=0.5, max_tokens=1500,
+        )
+        u = adapter.get_last_usage()
+        if u:
+            tok_in += u.get("tokens_in", 0)
+            tok_out += u.get("tokens_out", 0)
+        d = _parse_json(raw)
+        if isinstance(d, dict):
+            profiles.append(d)
+    data = _merge_bio(profiles)
     if data:
         c.role = data.get("role") or c.role
         c.gender = data.get("gender") or c.gender
@@ -148,14 +179,22 @@ async def generate_profile(session: AsyncSession, char_id: int, owner_id: int) -
         c.catchphrase = data.get("catchphrase") or c.catchphrase
         c.description = data.get("description") or c.description
         c.source = "auto"
-        # 统计出场次数：人物名在全文出现次数
-        c.appearances = text.count(c.name)
+        # 出场次数基于全量正文统计（不再受截断影响）
+        c.appearances = full_text.count(c.name)
         await session.commit()
+    if tok_in or tok_out:
+        await task_service.record_llm_usage(
+            owner_id=owner_id, config_id=config_id, model=model_name,
+            task_type="character", tokens_in=tok_in, tokens_out=tok_out,
+        )
     return _to_detail(c)
 
 
 def _parse_json(raw: str) -> dict:
     """容错解析 LLM 输出的 JSON（去 markdown 包裹、截取首尾花括号）。"""
+    # 兼容部分模型把内容以列表（内容块）形式返回的情况，先拼成文本
+    if isinstance(raw, list):
+        raw = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in raw)
     raw = (raw or "").strip()
     if raw.startswith("```"):
         raw = raw.strip("`")
@@ -168,3 +207,283 @@ def _parse_json(raw: str) -> dict:
         return json.loads(raw)
     except Exception:
         return {}
+
+
+# ---------------------------------------------------------------------------
+# 长文分片 / 跨片合并 / 流式收集 工具函数
+# ---------------------------------------------------------------------------
+_CHUNK_MAX_CHARS = 6000
+
+
+def _chunk_text(text: str, max_chars: int = _CHUNK_MAX_CHARS) -> list[str]:
+    """将长文按字符窗口切分为多个片段，优先在换行/句末断句，避免切碎句子。
+
+    关键点：
+        1. 单段不超过 max_chars，用于突破单次 prompt 的 1 万字硬截断上限。
+        2. 断点优先选换行/句号等标点，减少语义割裂。
+        3. 返回片段列表，调用方按阅读顺序逐片分析（主要人物多在前段）。
+    """
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+    chunks: list[str] = []
+    start = 0
+    n = len(text)
+    while start < n:
+        end = min(start + max_chars, n)
+        if end >= n:
+            chunks.append(text[start:])
+            break
+        cut = -1
+        for sep in ("\n", "。", "！", "？", "!", "?"):
+            idx = text.rfind(sep, start, end)
+            if idx > cut:
+                cut = idx
+        if cut < start:
+            cut = end - 1
+        chunks.append(text[start:cut + 1])
+        start = cut + 1
+    return chunks
+
+
+def _merge_characters(items: list[dict]) -> list[dict]:
+    """跨分片抽取结果按姓名去重合并：保留首个，字段缺失时补后续非空值，description 取最长。"""
+    by_name: dict[str, dict] = {}
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        name = (it.get("name") or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key not in by_name:
+            by_name[key] = dict(it)
+            continue
+        cur = by_name[key]
+        for f in ("role", "gender", "identity", "personality", "appearance", "catchphrase", "description"):
+            v = (it.get(f) or "").strip()
+            if not v:
+                continue
+            cur_v = (cur.get(f) or "").strip()
+            if not cur_v:
+                cur[f] = v
+            elif f == "description" and len(v) > len(cur_v):
+                cur[f] = v
+    return list(by_name.values())
+
+
+def _merge_bio(profiles: list[dict]) -> dict:
+    """单人物多分片小传合并：各字段取首个非空值，description 取最长。"""
+    merged: dict = {}
+    for p in profiles:
+        if not isinstance(p, dict):
+            continue
+        for f in ("role", "gender", "identity", "personality", "appearance", "catchphrase", "description"):
+            v = (p.get(f) or "").strip()
+            if not v:
+                continue
+            cur = (merged.get(f) or "").strip()
+            if not cur:
+                merged[f] = v
+            elif f == "description" and len(v) > len(cur):
+                merged[f] = v
+    return merged
+
+
+async def _stream_collect(adapter, messages: list[dict], task_id, lo: int, hi: int,
+                          stage: str = "analyzing", **opts) -> str:
+    """流式调用 chat_stream，边收边回写进度，返回完整文本；usage 由 adapter 记录。
+
+    关键点：
+        1. 复用适配器 chat_stream 异步生成器，逐 piece 累积完整文本。
+        2. 每 ~0.4s 按已收字符量在 [lo, hi] 区间回写进度，避免长文等待期进度卡死。
+        3. task_id 为 None 时不回写（如同步路径）。
+    """
+    collected: list[str] = []
+    total = 0
+    last = time.monotonic()
+    async for piece in adapter.chat_stream(messages, **opts):
+        collected.append(piece)
+        total += len(piece)
+        now = time.monotonic()
+        if task_id is not None and now - last >= 0.4:
+            frac = min(1.0, total / 2500.0)
+            prog = lo + int(frac * (hi - lo))
+            await task_service.update_task_progress(task_id, stage=stage, progress=prog, status="running")
+            last = now
+    return "".join(collected)
+
+
+async def generate_profile_async(char_id: int, owner_id: int, task_id: int | None = None) -> None:
+    """后台生成小传：自开会话调用 generate_profile，进度回写统一任务，异常仅记录不抛出。"""
+    from db import SessionLocal
+    async with SessionLocal() as session:
+        try:
+            if task_id:
+                await task_service.update_task_progress(task_id, stage="generating", progress=30, status="running", started_at=datetime.now(timezone.utc))
+            await generate_profile(session, char_id, owner_id, task_id)
+            if task_id:
+                await task_service.update_task_progress(task_id, stage="done", progress=100, status="success", finished_at=datetime.now(timezone.utc))
+        except Exception as e:  # 后台任务异常不应影响主流程
+            from common.task_errors import to_user_error
+            logger.exception("人物小传生成失败 char=%s: %s", char_id, e)
+            if task_id:
+                await task_service.update_task_progress(task_id, stage="failed", status="failed", error=to_user_error(e), finished_at=datetime.now(timezone.utc))
+            print(f"[character] 生成失败 char={char_id}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# 批量人物分析（小说详情页「任务分析」按钮触发）
+# ---------------------------------------------------------------------------
+_ANALYZE_PROMPT = """你是小说人物分析助手，请根据提供的小说简介和正文片段，识别小说中的主要人物并生成结构化档案。
+
+请严格按以下 JSON 数组格式输出（只输出 JSON，不要包含任何解释或 markdown 标记）：
+[
+  {
+    "name": "人物姓名",
+    "role": "主角/配角/反派",
+    "gender": "男/女/未知",
+    "identity": "身份/职业",
+    "personality": "性格特点",
+    "appearance": "外貌特征",
+    "catchphrase": "口头禅",
+    "description": "150字以内的人物小传，包含大致经历"
+  }
+]
+
+要求：
+1. 只输出 JSON 数组，不要加 ```json 标记
+2. 至少输出主角，最多输出 8 个主要人物
+3. 如果小说正文中人物信息不足，可适当基于简介推断
+4. description 控制在 150 字以内
+
+小说名称：《{novel_name}》
+小说简介：{summary}
+小说正文片段：
+{text}"""
+
+
+async def analyze_and_create_characters(
+    novel_id: int, owner_id: int, novel_name: str, summary: str,
+    async_task_id: int | None = None,
+) -> dict:
+    """异步分析小说并自动创建人物档案（后台任务，支持长文分片 + 流式进度）。
+
+    整体思路：
+        取小说简介 + 章节全量正文 → 按字符窗口分片 → 逐片流式调 chat 适配器分析
+        → 跨片按姓名去重合并 → 逐条写入人物卡。
+    关键点：
+        1. 独立 SessionLocal，不持有请求会话。
+        2. 长文分片（每片携带小说简介作全局上下文），突破单 prompt 1 万字截断，覆盖完整正文。
+        3. 流式调用逐片回写进度（20→50），避免等待期进度卡死。
+        4. 同名人物理跳过（幂等）；跨片合并时补缺失字段、description 取最长。
+        5. 写入 LLMUsage 记录累计 Token 用量供仪表盘统计。
+    实现逻辑：
+        拼接全量正文 → 分片 → 逐片 prompt → _stream_collect → _parse_json →
+        _merge_characters → 逐条 create（跳过已存在）。
+    """
+    from db import SessionLocal
+    async with SessionLocal() as session:
+        try:
+            if async_task_id:
+                await task_service.update_task_progress(
+                    async_task_id, stage="preparing", progress=5, status="running",
+                    started_at=datetime.now(timezone.utc),
+                )
+            # 取章节正文（全量，非分页元组）
+            chapters = await novel_repo.list_all_chapters(session, novel_id)
+            if not chapters:
+                raise BizError(400, "该小说暂无章节正文，请先上传并解析文档")
+            full_text = "\n".join(ch.content for ch in chapters)
+            # 长文策略：按阅读顺序分片，每片在 prompt 中携带简介；主要人物多在前段，优先覆盖
+            chunks = _chunk_text(full_text)
+            n = len(chunks)
+            adapter, model_name = await _get_chat_adapter(session, owner_id)
+            cfgs = await llm_repo.list_for_dispatch(session, owner_id, "chat")
+            config_id = cfgs[0].id if cfgs else None
+
+            all_chars: list[dict] = []
+            tok_in = tok_out = 0
+            for i, chunk in enumerate(chunks):
+                prompt = _ANALYZE_PROMPT.replace("{novel_name}", novel_name).replace(
+                    "{summary}", summary or "暂无").replace("{text}", chunk)
+                lo = 20 + int(i / n * 30)   # 进度区间：20 → 50
+                hi = 20 + int((i + 1) / n * 30)
+                if async_task_id:
+                    await task_service.update_task_progress(
+                        async_task_id, stage="analyzing", progress=lo, status="running")
+                raw = await _stream_collect(
+                    adapter, [{"role": "user", "content": prompt}], async_task_id,
+                    lo=lo, hi=hi, stage="analyzing", temperature=0.5, max_tokens=3000,
+                )
+                u = adapter.get_last_usage()
+                if u:
+                    tok_in += u.get("tokens_in", 0)
+                    tok_out += u.get("tokens_out", 0)
+                chars_data = _parse_json(raw)
+                if isinstance(chars_data, list):
+                    all_chars.extend(chars_data)
+                elif isinstance(chars_data, dict):
+                    all_chars.append(chars_data)
+
+            # 跨分片去重合并
+            merged = _merge_characters(all_chars)
+
+            if async_task_id:
+                await task_service.update_task_progress(
+                    async_task_id, stage="creating", progress=55, status="running",
+                )
+
+            created = 0
+            skipped = 0
+            for item in merged:
+                name = (item.get("name") or "").strip()
+                if not name:
+                    continue
+                # 同名人物跳过
+                existing = await character_repo.get_by_novel_name(session, novel_id, name)
+                if existing:
+                    skipped += 1
+                    continue
+                c = Character(
+                    novel_id=novel_id, owner_id=owner_id, name=name,
+                    role=(item.get("role") or "配角").strip() or "配角",
+                    gender=(item.get("gender") or "").strip() or None,
+                    identity=(item.get("identity") or "").strip() or None,
+                    personality=(item.get("personality") or "").strip() or None,
+                    appearance=(item.get("appearance") or "").strip() or None,
+                    catchphrase=(item.get("catchphrase") or "").strip() or None,
+                    description=(item.get("description") or "").strip()[:150] or None,
+                    source="auto",
+                    appearances=0,
+                )
+                session.add(c)
+                created += 1
+            await session.commit()
+
+            if tok_in or tok_out:
+                await task_service.record_llm_usage(
+                    owner_id=owner_id, config_id=config_id, model=model_name,
+                    task_type="character_analysis", tokens_in=tok_in, tokens_out=tok_out,
+                )
+
+            if async_task_id:
+                await task_service.update_task_progress(
+                    async_task_id, stage="done", progress=100, status="success",
+                    message=f"已创建 {created} 个人物" + (f"，跳过 {skipped} 个已存在" if skipped else ""),
+                    finished_at=datetime.now(timezone.utc),
+                    extra={"created": created, "skipped": skipped, "chunks": n},
+                )
+            return {"created": created, "skipped": skipped, "chunks": n}
+        except Exception as e:
+            await session.rollback()
+            logger.exception("人物分析失败: %s", e)
+            from common.task_errors import to_user_error
+            if async_task_id:
+                await task_service.update_task_progress(
+                    async_task_id, stage="failed", status="failed",
+                    error=to_user_error(e), finished_at=datetime.now(timezone.utc),
+                )
+            raise
+
