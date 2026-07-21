@@ -20,6 +20,7 @@ from db import get_session
 from auth.jwt import get_current_user
 from common.response import success
 from common.exceptions import BizError
+from common import task_queue
 from services import graph_service, task_service
 from repositories import novel_repo
 
@@ -53,7 +54,7 @@ async def extract_graph(
     if not novel:
         raise BizError(404, "小说不存在")
     task = await task_service.create_task(session, user.id, "graph", f"小说{novel.name}-知识图谱抽取", novel_id=novel_id)
-    background_tasks.add_task(graph_service.run_extract, novel_id, user.id, task.id)
+    task_queue.submit(graph_service.run_extract, novel_id, user.id, task.id)
     return success({"task_id": task.id}, "已启动实体关系抽取")
 
 

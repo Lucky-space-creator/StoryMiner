@@ -20,6 +20,7 @@ from db import get_session
 from auth.jwt import get_current_user
 from common.response import success, paginate
 from common.exceptions import BizError
+from common import task_queue
 from schemas.knowledge_base import KBCreate, KBUpdate, BuildRequest
 from schemas.chunk import ChunkRequest
 from services import kb_service, chunk_service, task_service
@@ -137,7 +138,7 @@ async def chunk_kb(
     novel = await novel_repo.get_novel(session, user.id, kb.novel_id)
     novel_name = novel.name if novel else f"知识库{kb_id}"
     task = await task_service.create_task(session, user.id, "chunk", f"小说{novel_name}-构建索引", novel_id=kb.novel_id, kb_id=kb_id, extra={"mode": "full"})
-    background_tasks.add_task(chunk_service.chunk_and_index_async, user.id, kb_id, data, False, task.id)
+    task_queue.submit(chunk_service.chunk_and_index_async, user.id, kb_id, data, False, task.id)
     return success({"task_id": task.id}, "已启动切割")
 
 
@@ -153,7 +154,7 @@ async def build_kb(
     novel = await novel_repo.get_novel(session, user.id, kb.novel_id)
     novel_name = novel.name if novel else f"知识库{kb_id}"
     task = await task_service.create_task(session, user.id, "chunk", f"小说{novel_name}-构建索引", novel_id=kb.novel_id, kb_id=kb_id, doc_id=data.doc_id, extra={"mode": "build"})
-    background_tasks.add_task(chunk_service.build_doc_async, user.id, kb_id, data.doc_id, data, task.id)
+    task_queue.submit(chunk_service.build_doc_async, user.id, kb_id, data.doc_id, data, task.id)
     return success({"task_id": task.id}, "已启动构建")
 
 
@@ -186,7 +187,7 @@ async def reindex(
     novel = await novel_repo.get_novel(session, user.id, kb.novel_id)
     novel_name = novel.name if novel else f"知识库{kb_id}"
     task = await task_service.create_task(session, user.id, "chunk", f"小说{novel_name}-重建索引", novel_id=kb.novel_id, kb_id=kb_id, extra={"mode": "full"})
-    background_tasks.add_task(chunk_service.chunk_and_index_async, user.id, kb_id, data, True, task.id)
+    task_queue.submit(chunk_service.chunk_and_index_async, user.id, kb_id, data, True, task.id)
     return success({"task_id": task.id}, "已启动重建")
 
 

@@ -52,6 +52,19 @@ async def model_stats(user: User = Depends(get_current_user), session=Depends(ge
 
 
 @router.get("/tasks")
-async def tasks(user: User = Depends(get_current_user), session=Depends(get_session)):
-    """异步任务进度总览（M14.1）：任务列表 + 状态计数。"""
-    return success(await dashboard_service.get_task_overview(session, user.id))
+async def tasks(
+    user: User = Depends(get_current_user),
+    session=Depends(get_session),
+    status: str | None = Query(None, description="running/success/failed/cancelled"),
+    type: str | None = Query(None, description="parse/chunk/graph/character"),
+    novel_name: str | None = Query(None, description="小说名模糊查询"),
+    completed: bool | None = Query(None, description="是否完成：true=已结束, false=进行中"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+):
+    """异步任务进度总览（M14.1）：分页 + 条件查询（是否完成/小说名），任务列表 + 状态计数。"""
+    data = await dashboard_service.get_task_overview(
+        session, user.id, status=status, type=type, novel_name=novel_name,
+        completed=completed, page=page, page_size=page_size,
+    )
+    return success(data)

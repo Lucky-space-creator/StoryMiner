@@ -10,8 +10,11 @@ export const STAGE_TEXT = {
   storing: '写入索引',
   extracting: '抽取实体中',
   generating: '生成小传中',
+  structure: '分析结构中',
+  analyzing: '分析中',
   done: '已完成',
   failed: '失败',
+  cancelled: '已取消',
 }
 
 export function stageText(s) {
@@ -23,13 +26,15 @@ export const TYPE_TEXT = {
   chunk: '切割/向量化',
   graph: '知识图谱',
   character: '人物小传',
+  character_analysis: '人物分析',
+  chapter_analysis: '章节解析',
 }
 
 export function typeText(t) {
   return TYPE_TEXT[t] || t || '任务'
 }
 
-export const STATUS_TEXT = { running: '进行中', success: '成功', failed: '失败' }
+export const STATUS_TEXT = { running: '进行中', success: '成功', failed: '失败', cancelled: '已取消' }
 
 export function statusText(s) {
   return STATUS_TEXT[s] || s || '未知'

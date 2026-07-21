@@ -20,6 +20,7 @@ from db import get_session
 from auth.jwt import get_current_user
 from common.response import success
 from common.exceptions import BizError
+from common import task_queue
 from services import character_service, task_service
 from repositories import character_repo, novel_repo
 
@@ -118,7 +119,7 @@ async def generate_profile(
     novel = await novel_repo.get_novel(session, user.id, char.novel_id)
     novel_name = novel.name if novel else f"人物{char.name}"
     task = await task_service.create_task(session, user.id, "character", f"小说{novel_name}-人物抽取实体", novel_id=char.novel_id, target_id=char_id)
-    background_tasks.add_task(character_service.generate_profile_async, char_id, user.id, task.id)
+    task_queue.submit(character_service.generate_profile_async, char_id, user.id, task.id)
     return success({"task_id": task.id}, "已启动小传生成")
 
 
@@ -140,7 +141,7 @@ async def analyze_characters(
         session, user.id, "character_analysis",
         f"小说{novel.name}-人物分析", novel_id=novel_id,
     )
-    background_tasks.add_task(
+    task_queue.submit(
         character_service.analyze_and_create_characters,
         novel_id=novel_id, owner_id=user.id,
         novel_name=novel.name, summary=novel.summary or "",

@@ -40,6 +40,9 @@ class AsyncTask(Base):
     progress: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     status: Mapped[str] = mapped_column(String(16), default="running", nullable=False)
     error: Mapped[str | None] = mapped_column(Text)
+    # Token 消耗：后台任务边跑边回写，取消/失败时也能体现已消耗额度
+    tokens_in: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    tokens_out: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     extra: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)

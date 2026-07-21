@@ -44,7 +44,8 @@ vector_store:
   chroma:
     persist_dir: "storage/chroma"
 
-# 存储后端（local / minio）；接入 MinIO 后默认走对象存储
+# 存储后端（local / minio）；MinIO 已在本地启动（127.0.0.1:9000），恢复使用对象存储。
+# 注：残脉逆仙等已有小说上传时即写入 MinIO，切换后端后文件仍可正常读取。
 storage:
   backend: minio
 

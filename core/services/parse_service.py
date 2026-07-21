@@ -26,6 +26,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import MAX_TXT_BYTES, MAX_OTHER_BYTES, MAX_CHAPTERS, ALLOWED_EXT
 from common.exceptions import BizError
+from common import task_cancel
+from common import task_queue
 from common.threadpool import run_in_thread
 from models.novel_content import Document, ParseTask, Chapter
 from repositories import novel_repo
@@ -82,8 +84,8 @@ async def handle_upload(
     limit = MAX_TXT_BYTES if ext == ".txt" else MAX_OTHER_BYTES
     if len(data) > limit:
         raise BizError(400, f"文件超过上限（{'50MB' if ext == '.txt' else '200MB'}）")
-    # 去重：sha256 与文件写入为同步阻塞 IO，放到线程池避免阻塞事件循环影响其他用户请求
-    path, digest = await run_in_thread(save_file, owner_id, novel_id, file.filename or "upload", data)
+    # 落盘去重：storage.save 为异步函数（内部已用 asyncio.to_thread 卸载阻塞 IO），直接 await
+    path, digest = await save_file(owner_id, novel_id, file.filename or "upload", data)
     dup = await novel_repo.find_document_by_hash(session, novel_id, digest)
     if dup:
         # 已存在则清理刚落盘对象，返回冲突
@@ -112,8 +114,8 @@ async def handle_upload(
     )
     task.extra = {**(task.extra or {}), "async_task_id": async_task.id}
     await session.commit()
-    # 调度后台解析
-    background.add_task(_run_parse, task.id, path, owner_id, novel_id, doc.id)
+    # 调度后台解析（入全局串行队列，逐一执行；排队中前端显示「排队中」）
+    task_queue.submit(_run_parse, task.id, path, owner_id, novel_id, doc.id)
     return {"task_id": task.id, "doc_id": doc.id, "name": doc.name, "status": "running"}
 
 
@@ -123,6 +125,10 @@ async def _run_parse(task_id: int, path: str, owner_id: int, novel_id: int, doc_
         task = await novel_repo.get_parse_task(session, task_id)
         doc = await novel_repo.get_document(session, doc_id)
         async_task_id = (task.extra or {}).get("async_task_id")
+        # 用户主动取消：解析开始前感知并直接置为已取消（切章为单线程不可中断，仅起点拦截）
+        if async_task_id and task_cancel.is_cancelled(async_task_id):
+            await task_service.update_task_progress(async_task_id, stage="cancelled", status="cancelled", error="用户主动取消任务", finished_at=datetime.now(timezone.utc))
+            return
         try:
             await _publish(task_id, {"stage": "parsing", "progress": 10, "status": "running", "payload": {}})
             task.stage, task.progress = "parsing", 10
@@ -130,8 +136,8 @@ async def _run_parse(task_id: int, path: str, owner_id: int, novel_id: int, doc_
             if async_task_id:
                 await task_service.update_task_progress(async_task_id, stage="parsing", progress=10, status="running", started_at=task.started_at)
             # 读取文本（多格式：TXT 直接解码，其他按忽略错误解码，阶段1仅保证可运行）
-            # read_file 为同步阻塞 IO（本地文件读取），放线程池避免阻塞事件循环
-            raw = await run_in_thread(read_file, path)
+            # read_file 为异步函数（内部已用线程池卸载阻塞读取），直接 await
+            raw = await read_file(path)
             text = raw.decode("utf-8", errors="ignore")
             await _publish(task_id, {"stage": "splitting", "progress": 40, "status": "running", "payload": {}})
             task.stage, task.progress = "splitting", 40
@@ -155,12 +161,18 @@ async def _run_parse(task_id: int, path: str, owner_id: int, novel_id: int, doc_
             task.stage, task.progress, task.status = "done", 100, "success"
             task.finished_at = datetime.now(timezone.utc)
             await session.commit()
+            # 收尾前确认是否被取消（防状态回退为成功）
+            if async_task_id and task_cancel.is_cancelled(async_task_id):
+                await task_service.update_task_progress(async_task_id, stage="cancelled", status="cancelled", error="用户主动取消任务", finished_at=task.finished_at)
+                return
             if async_task_id:
                 await task_service.update_task_progress(async_task_id, stage="done", progress=100, status="success", finished_at=task.finished_at)
             await _publish(task_id, {"stage": "done", "progress": 100, "status": "success",
                                      "payload": {"chapter_count": len(objs)}})
             # 解析成功后触发 AI 概括生成（异步，不阻塞当前任务）
-            await _trigger_ai_summary(owner_id, novel_id, novel.name)
+            # 注意：本作用域无 novel 变量，需按 owner 重新查询，避免引用未定义变量导致 NameError
+            novel = await novel_repo.get_novel(session, owner_id, novel_id)
+            await _trigger_ai_summary(owner_id, novel_id, novel.name if novel else "")
         except Exception as e:  # 解析失败：回写状态并推送
             from common.task_errors import to_user_error
             user_msg = to_user_error(e)
@@ -202,7 +214,7 @@ async def retry_task(session: AsyncSession, owner_id: int, task_id: int, backgro
     task.error, task.started_at, task.finished_at = None, None, None
     doc.status, doc.error = "pending", None
     await session.commit()
-    background.add_task(_run_parse, task.id, doc.object_key, owner_id, task.novel_id, doc.id)
+    task_queue.submit(_run_parse, task.id, doc.object_key, owner_id, task.novel_id, doc.id)
     return {
         "id": task.id, "novel_id": task.novel_id, "doc_id": task.doc_id,
         "stage": task.stage, "progress": task.progress, "status": task.status,
@@ -249,16 +261,13 @@ async def _trigger_ai_summary(owner_id: int, novel_id: int, novel_name: str) -> 
                 novel_id=novel_id, extra={"novel_name": novel_name},
             )
             summary_task_id = summary_task.id
-        # 真正异步执行，不等待结果（延迟导入 novel_service 避免 services 包循环依赖）
+        # 入全局串行队列执行，不等待结果（延迟导入 novel_service 避免 services 包循环依赖）
         from services import novel_service as _novel_service
-        task = asyncio.create_task(
-            _novel_service.generate_ai_summary(
-                novel_id=novel_id, owner_id=owner_id,
-                novel_name=novel_name, async_task_id=summary_task_id,
-            )
+        task_queue.submit(
+            _novel_service.generate_ai_summary,
+            novel_id=novel_id, owner_id=owner_id,
+            novel_name=novel_name, async_task_id=summary_task_id,
         )
-        # done 回调：捕获并记录任务异常，避免「exception was never retrieved」告警
-        task.add_done_callback(_on_bg_task_done)
     except Exception as e:  # noqa: BLE001
         logger.warning("触发 AI 概括生成失败：小说 %s，错误：%s", novel_id, e)
 

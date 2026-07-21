@@ -24,7 +24,7 @@ export function useTaskPoller(intervalMs = 5000) {
       const running = res.data || []
       const runningIds = new Set(running.map((t) => t.id))
       for (const t of running) {
-        store.upsert({ id: t.id, type: t.type, name: t.name, progress: t.progress, stage: stageText(t.stage), status: t.status })
+        store.upsert({ id: t.id, type: t.type, name: t.name, progress: t.progress, stage: stageText(t.stage), status: t.status, tokens_in: t.tokens_in, tokens_out: t.tokens_out, error: t.error })
         knownIds.add(t.id)
       }
       // 完成检测：曾被追踪但已不在进行中列表的任务
@@ -33,9 +33,10 @@ export function useTaskPoller(intervalMs = 5000) {
           knownIds.delete(id)
           try {
             const d = (await getTask(id)).data
-            store.upsert({ id, type: d.type, name: d.name, progress: d.progress, stage: stageText(d.stage), status: d.status, error: d.error })
+            store.upsert({ id, type: d.type, name: d.name, progress: d.progress, stage: stageText(d.stage), status: d.status, tokens_in: d.tokens_in, tokens_out: d.tokens_out, error: d.error })
             if (d.status === 'success') notify(`任务「${d.name}」已完成`, 'success')
             else if (d.status === 'failed') notify(`任务「${d.name}」失败：${d.error || ''}`, 'error')
+            else if (d.status === 'cancelled') notify(`任务「${d.name}」已取消`, 'info')
           } catch {
             /* 详情拉取失败忽略 */
           }

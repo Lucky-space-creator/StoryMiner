@@ -3,6 +3,7 @@ import Login from '@/views/auth/Login.vue'
 import Dashboard from '@/views/Dashboard.vue'
 import NovelList from '@/views/novels/NovelList.vue'
 import NovelDetail from '@/views/novels/NovelDetail.vue'
+import NovelReader from '@/views/novels/NovelReader.vue'
 import KBList from '@/views/kb/KBList.vue'
 import KBDetail from '@/views/kb/KBDetail.vue'
 import ChunkBrowser from '@/views/chunks/ChunkBrowser.vue'
@@ -24,6 +25,7 @@ const routes = [
   { path: '/dashboard', name: 'dashboard', component: Dashboard, meta: { title: '仪表盘', requiresAuth: true } },
   { path: '/novels', name: 'novels', component: NovelList, meta: { title: '小说', requiresAuth: true } },
   { path: '/novels/:id', name: 'novel-detail', component: NovelDetail, meta: { title: '小说详情', requiresAuth: true } },
+  { path: '/novels/:id/read', name: 'novel-reader', component: NovelReader, meta: { title: '阅读小说', requiresAuth: true } },
   { path: '/knowledge-bases', name: 'kbs', component: KBList, meta: { title: '知识库', requiresAuth: true } },
   { path: '/knowledge-bases/:id', name: 'kb-detail', component: KBDetail, meta: { title: '知识库详情', requiresAuth: true } },
   { path: '/chunks', name: 'chunks', component: ChunkBrowser, meta: { title: '文档切片', requiresAuth: true } },

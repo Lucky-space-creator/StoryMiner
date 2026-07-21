@@ -16,6 +16,8 @@
         <Button variant="secondary" :loading="uploading" @click="docsEl?.click()">上传文档</Button>
         <Button @click="goKb">建知识库</Button>
         <Button variant="secondary" :loading="analyzing" @click="analyzeNovel">人物分析</Button>
+        <Button variant="secondary" :loading="chapterAnalyzing" @click="triggerChapterAnalysis">章节解析</Button>
+        <Button @click="goReadNovel">阅读小说</Button>
       </div>
     </div>
 
@@ -29,6 +31,44 @@
       </div>
       <p class="text-sm text-app leading-relaxed">{{ novel.ai_summary }}</p>
     </div>
+
+    <!-- 章节解析结果展示 -->
+    <Card v-if="chapterAnalysis">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-medium text-app">章节解析</h3>
+        <Button variant="ghost" size="sm" @click="loadChapterAnalysis">刷新</Button>
+      </div>
+      <!-- 整体结构 -->
+      <div v-if="chapterAnalysis.structure" class="bg-surface2 border border-app rounded-[var(--radius-sm)] p-3 mb-4">
+        <p class="text-xs font-medium text-accent mb-1">整体结构分析</p>
+        <p class="text-sm text-app">{{ chapterAnalysis.structure.overall_analysis || '暂无' }}</p>
+        <div class="flex flex-wrap gap-2 mt-2 text-xs text-muted">
+          <span>类型：{{ chapterAnalysis.structure.structure_type || '未知' }}</span>
+          <span v-if="chapterAnalysis.structure.narrative_style">视角：{{ chapterAnalysis.structure.narrative_style }}</span>
+          <span>总章节：{{ chapterAnalysis.total }}</span>
+        </div>
+        <!-- 分卷信息 -->
+        <div v-if="chapterAnalysis.structure.volumes && chapterAnalysis.structure.volumes.length" class="mt-2 space-y-1">
+          <p class="text-xs text-muted">分卷结构：</p>
+          <div v-for="v in chapterAnalysis.structure.volumes" :key="v.title" class="text-xs text-app">
+            <span class="font-medium">{{ v.title }}</span>
+            <span class="text-muted">（第{{ v.chapter_range }}章）{{ v.summary }}</span>
+          </div>
+        </div>
+      </div>
+      <!-- 各章节分析列表（每章仅一条，只显示标题+摘要） -->
+      <div v-if="chapterAnalysis.chapters && chapterAnalysis.chapters.length" class="space-y-1 max-h-80 overflow-y-auto">
+        <p class="text-xs text-muted mb-2">共 {{ chapterAnalysis.total }} 章，已分析 {{ analyzedCount }} 章</p>
+        <div v-for="ch in chapterAnalysis.chapters" :key="'ch_' + ch.chapter_no" class="flex items-start gap-2 py-1.5 border-b border-stone-100 last:border-0 text-sm">
+          <span class="text-xs text-muted shrink-0 w-12 text-right">{{ ch.chapter_no }}</span>
+          <div class="min-w-0 flex-1">
+            <p class="text-app truncate">{{ ch.title || ('第' + ch.chapter_no + '章') }}</p>
+            <p v-if="ch.analysis?.summary" class="text-muted text-xs mt-0.5 line-clamp-1">{{ ch.analysis.summary }}</p>
+            <p v-else class="text-xs text-muted italic mt-0.5">待分析</p>
+          </div>
+        </div>
+      </div>
+    </Card>
 
     <Card>
       <div class="flex items-center justify-between mb-3 gap-3 flex-wrap">
@@ -81,7 +121,7 @@
 //   1. 文档归属小说，列表接口 GET /novels/{id}/documents 已分页。
 //   2. 上传支持多文件，逐个解析；状态 pending/parsing/done/failed 实时反映。
 //   3. 删除/重命名走 /documents/{id}，按 owner 隔离。
-import { ref, reactive, onMounted, onBeforeUnmount } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import Card from '@/components/ui/Card.vue'
 import Button from '@/components/ui/Button.vue'
@@ -93,7 +133,7 @@ import Input from '@/components/ui/Input.vue'
 import Pagination from '@/components/ui/Pagination.vue'
 import EmptyState from '@/components/ui/EmptyState.vue'
 import ConfirmDialog from '@/components/ui/ConfirmDialog.vue'
-import { getNovel, listNovelDocuments, uploadDocuments, deleteNovelDocument, renameNovelDocument } from '@/api/novels'
+import { getNovel, listNovelDocuments, uploadDocuments, deleteNovelDocument, renameNovelDocument, analyzeChapters, getChapterAnalysis } from '@/api/novels'
 import { analyzeCharacters } from '@/api/characters'
 import { useToast } from '@/composables/useToast'
 
@@ -105,6 +145,8 @@ const documents = ref([])
 const loading = ref(true)
 const uploading = ref(false)
 const analyzing = ref(false)
+const chapterAnalyzing = ref(false)
+const chapterAnalysis = ref(null)
 const docsEl = ref(null)
 
 // 分页状态
@@ -220,6 +262,38 @@ async function analyzeNovel() {
   }
 }
 
+// 章节解析
+async function triggerChapterAnalysis() {
+  chapterAnalyzing.value = true
+  try {
+    const res = await analyzeChapters(route.params.id)
+    notify(`章节解析已启动（任务 #${res.data?.task_id || '—'}），可在仪表盘查看进度`, 'info')
+  } catch (e) {
+    notify(e.message || '启动章节解析失败', 'error')
+  } finally {
+    chapterAnalyzing.value = false
+  }
+}
+
+async function loadChapterAnalysis() {
+  try {
+    const res = await getChapterAnalysis(route.params.id)
+    chapterAnalysis.value = res.data || null
+  } catch (e) {
+    // 静默失败，章节分析数据可能尚未生成
+  }
+}
+
+// 阅读小说：跳转到阅读页面
+function goReadNovel() {
+  router.push({ path: `/novels/${route.params.id}/read` })
+}
+
+const analyzedCount = computed(() => {
+  if (!chapterAnalysis.value?.chapters) return 0
+  return chapterAnalysis.value.chapters.filter(c => c.analysis).length
+})
+
 function openRename(row) {
   renameForm.id = row.id
   renameForm.name = row.name
@@ -265,6 +339,7 @@ onMounted(async () => {
     const res = await getNovel(route.params.id)
     novel.value = res.data || null
     await loadDocs()
+    await loadChapterAnalysis()
   } catch (e) {
     notify(e.message || '加载失败', 'error')
   } finally {

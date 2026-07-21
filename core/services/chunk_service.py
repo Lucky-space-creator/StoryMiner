@@ -23,9 +23,10 @@ from schemas.chunk import ChunkRequest
 from repositories import kb_repo, chunk_repo, llm_repo, novel_repo
 from services import chunker, llm_adapters, task_service
 from common import crypto
+from common import task_cancel
 from common.exceptions import BizError
 from common.response import paginate
-from common.threadpool import run_in_thread
+
 from storage import read as read_file, exists as exists_file
 from vectorstore.factory import get_vector_store
 from db import SessionLocal
@@ -71,8 +72,8 @@ async def _index_documents(
         if not doc.object_key or not await exists_file(doc.object_key):
             skipped_no_key += 1
             continue
-        # 文件读取为同步阻塞 IO，放线程池避免阻塞事件循环影响其他用户请求
-        raw = await run_in_thread(read_file, doc.object_key)
+        # 文件读取为异步 IO（storage.read 内部已用线程池卸载阻塞读取），直接 await
+        raw = await read_file(doc.object_key)
         text = raw.decode("utf-8", errors="ignore") if isinstance(raw, bytes) else str(raw)
         for p in chunker.chunk_document(text, strategy, size, overlap):
             pieces.append((doc.id, p))
@@ -152,6 +153,9 @@ async def _index_documents(
         in_flight[start] = asyncio.ensure_future(_run())
 
     while next_start < total or in_flight:
+        # 用户主动取消：在嵌入批次边界感知并中止（已落库切片保留）
+        if task_id and task_cancel.is_cancelled(task_id):
+            raise task_cancel.TaskCancelled("用户主动取消任务")
         while len(in_flight) < EMBED_CONCURRENCY and next_start < total:
             _launch(next_start)
             next_start += EMBED_BATCH
@@ -232,10 +236,17 @@ async def chunk_and_index_async(owner_id: int, kb_id: int, req: ChunkRequest, fu
                 timeout=timeout,
             )
             await session.commit()
-        await task_service.update_task_progress(task_id, progress=100, stage="done", status="success", message="切割完成", finished_at=datetime.now(timezone.utc), **stats)
+        # 收尾前确认是否被取消（嵌入在批次边界感知取消，此处兜底防状态回退）
+        if task_cancel.is_cancelled(task_id):
+            await task_service.update_task_progress(task_id, stage="cancelled", status="cancelled", error="用户主动取消任务", finished_at=datetime.now(timezone.utc))
+        else:
+            await task_service.update_task_progress(task_id, progress=100, stage="done", status="success", message="切割完成", finished_at=datetime.now(timezone.utc), **stats)
     except Exception as e:  # 后台任务异常：回写失败状态，避免前端轮询卡住
         from common.task_errors import to_user_error
-        await task_service.update_task_progress(task_id, progress=0, stage="failed", status="failed", error=to_user_error(e), finished_at=datetime.now(timezone.utc))
+        if isinstance(e, task_cancel.TaskCancelled):
+            await task_service.update_task_progress(task_id, stage="cancelled", status="cancelled", error=e.reason, finished_at=datetime.now(timezone.utc))
+        else:
+            await task_service.update_task_progress(task_id, progress=0, stage="failed", status="failed", error=to_user_error(e), finished_at=datetime.now(timezone.utc))
 
 
 async def build_doc_async(owner_id: int, kb_id: int, doc_id: int, req: ChunkRequest, task_id: int) -> None:
@@ -269,10 +280,17 @@ async def build_doc_async(owner_id: int, kb_id: int, doc_id: int, req: ChunkRequ
                 timeout=timeout,
             )
             await session.commit()
-        await task_service.update_task_progress(task_id, progress=100, stage="done", status="success", message="切割完成", finished_at=datetime.now(timezone.utc), **stats)
+        # 收尾前确认是否被取消（嵌入在批次边界感知取消，此处兜底防状态回退）
+        if task_cancel.is_cancelled(task_id):
+            await task_service.update_task_progress(task_id, stage="cancelled", status="cancelled", error="用户主动取消任务", finished_at=datetime.now(timezone.utc))
+        else:
+            await task_service.update_task_progress(task_id, progress=100, stage="done", status="success", message="切割完成", finished_at=datetime.now(timezone.utc), **stats)
     except Exception as e:  # 后台任务异常：回写失败状态，避免前端轮询卡住
         from common.task_errors import to_user_error
-        await task_service.update_task_progress(task_id, progress=0, stage="failed", status="failed", error=to_user_error(e), finished_at=datetime.now(timezone.utc))
+        if isinstance(e, task_cancel.TaskCancelled):
+            await task_service.update_task_progress(task_id, stage="cancelled", status="cancelled", error=e.reason, finished_at=datetime.now(timezone.utc))
+        else:
+            await task_service.update_task_progress(task_id, progress=0, stage="failed", status="failed", error=to_user_error(e), finished_at=datetime.now(timezone.utc))
 
 
 async def incremental_index(session: AsyncSession, owner_id: int, kb_id: int, req: ChunkRequest) -> dict:

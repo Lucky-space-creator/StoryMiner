@@ -25,6 +25,7 @@ from models.character import Character
 from repositories import character_repo, novel_repo, llm_repo
 from services import llm_adapters, task_service
 from common import crypto
+from common import task_cancel
 from common.exceptions import BizError
 
 logger = logging.getLogger(__name__)
@@ -166,6 +167,15 @@ async def generate_profile(session: AsyncSession, char_id: int, owner_id: int, t
         if u:
             tok_in += u.get("tokens_in", 0)
             tok_out += u.get("tokens_out", 0)
+        # 用户主动取消：回写已消耗 token 后中止
+        if task_id and task_cancel.is_cancelled(task_id):
+            if tok_in or tok_out:
+                await task_service.record_llm_usage(
+                    owner_id=owner_id, config_id=config_id, model=model_name,
+                    task_type="character", tokens_in=tok_in, tokens_out=tok_out,
+                )
+            await task_service.update_task_progress(task_id, tokens_in=tok_in, tokens_out=tok_out)
+            raise task_cancel.TaskCancelled("用户主动取消小传生成", tok_in, tok_out)
         d = _parse_json(raw)
         if isinstance(d, dict):
             profiles.append(d)
@@ -187,6 +197,8 @@ async def generate_profile(session: AsyncSession, char_id: int, owner_id: int, t
             owner_id=owner_id, config_id=config_id, model=model_name,
             task_type="character", tokens_in=tok_in, tokens_out=tok_out,
         )
+        if task_id:
+            await task_service.update_task_progress(task_id, tokens_in=tok_in, tokens_out=tok_out)
     return _to_detail(c)
 
 
@@ -200,9 +212,14 @@ def _parse_json(raw: str) -> dict:
         raw = raw.strip("`")
         if raw.lower().startswith("json"):
             raw = raw[4:]
-    start, end = raw.find("{"), raw.rfind("}")
-    if start != -1 and end != -1:
-        raw = raw[start:end + 1]
+    # 兼容顶层为 JSON 数组或对象：人物分析返回 [...]，图谱返回 {...}。
+    # 取更外层的包裹，避免把数组误截成「{...},{...}」导致 json.loads 失败。
+    obj_start, obj_end = raw.find("{"), raw.rfind("}")
+    arr_start, arr_end = raw.find("["), raw.rfind("]")
+    if arr_start != -1 and (obj_start == -1 or arr_start < obj_start):
+        raw = raw[arr_start:arr_end + 1]
+    elif obj_start != -1 and obj_end != -1:
+        raw = raw[obj_start:obj_end + 1]
     try:
         return json.loads(raw)
     except Exception:
@@ -329,7 +346,14 @@ async def generate_profile_async(char_id: int, owner_id: int, task_id: int | Non
             from common.task_errors import to_user_error
             logger.exception("人物小传生成失败 char=%s: %s", char_id, e)
             if task_id:
-                await task_service.update_task_progress(task_id, stage="failed", status="failed", error=to_user_error(e), finished_at=datetime.now(timezone.utc))
+                if isinstance(e, task_cancel.TaskCancelled):
+                    await task_service.update_task_progress(
+                        task_id, stage="cancelled", status="cancelled",
+                        error=e.reason, finished_at=datetime.now(timezone.utc),
+                        tokens_in=e.tokens_in, tokens_out=e.tokens_out,
+                    )
+                else:
+                    await task_service.update_task_progress(task_id, stage="failed", status="failed", error=to_user_error(e), finished_at=datetime.now(timezone.utc))
             print(f"[character] 生成失败 char={char_id}: {e}")
 
 
@@ -412,7 +436,8 @@ async def analyze_and_create_characters(
                 hi = 20 + int((i + 1) / n * 30)
                 if async_task_id:
                     await task_service.update_task_progress(
-                        async_task_id, stage="analyzing", progress=lo, status="running")
+                        async_task_id, stage="analyzing", progress=lo, status="running",
+                        tokens_in=tok_in, tokens_out=tok_out)
                 raw = await _stream_collect(
                     adapter, [{"role": "user", "content": prompt}], async_task_id,
                     lo=lo, hi=hi, stage="analyzing", temperature=0.5, max_tokens=3000,
@@ -421,6 +446,16 @@ async def analyze_and_create_characters(
                 if u:
                     tok_in += u.get("tokens_in", 0)
                     tok_out += u.get("tokens_out", 0)
+                # 用户主动取消：当前分片已消耗 token 需回写，随后中止
+                if async_task_id and task_cancel.is_cancelled(async_task_id):
+                    if tok_in or tok_out:
+                        await task_service.record_llm_usage(
+                            owner_id=owner_id, config_id=config_id, model=model_name,
+                            task_type="character_analysis", tokens_in=tok_in, tokens_out=tok_out,
+                        )
+                    await task_service.update_task_progress(
+                        async_task_id, tokens_in=tok_in, tokens_out=tok_out)
+                    raise task_cancel.TaskCancelled("用户主动取消人物", tok_in, tok_out)
                 chars_data = _parse_json(raw)
                 if isinstance(chars_data, list):
                     all_chars.extend(chars_data)
@@ -468,11 +503,23 @@ async def analyze_and_create_characters(
                     task_type="character_analysis", tokens_in=tok_in, tokens_out=tok_out,
                 )
 
+            # 收尾前再次确认是否被取消（避免取消请求晚于进度回写导致状态回退为成功）
+            if async_task_id and task_cancel.is_cancelled(async_task_id):
+                if tok_in or tok_out:
+                    await task_service.record_llm_usage(
+                        owner_id=owner_id, config_id=config_id, model=model_name,
+                        task_type="character_analysis", tokens_in=tok_in, tokens_out=tok_out,
+                    )
+                await task_service.update_task_progress(
+                    async_task_id, tokens_in=tok_in, tokens_out=tok_out)
+                raise task_cancel.TaskCancelled("用户主动取消人物", tok_in, tok_out)
+
             if async_task_id:
                 await task_service.update_task_progress(
                     async_task_id, stage="done", progress=100, status="success",
                     message=f"已创建 {created} 个人物" + (f"，跳过 {skipped} 个已存在" if skipped else ""),
                     finished_at=datetime.now(timezone.utc),
+                    tokens_in=tok_in, tokens_out=tok_out,
                     extra={"created": created, "skipped": skipped, "chunks": n},
                 )
             return {"created": created, "skipped": skipped, "chunks": n}
@@ -481,6 +528,14 @@ async def analyze_and_create_characters(
             logger.exception("人物分析失败: %s", e)
             from common.task_errors import to_user_error
             if async_task_id:
+                if isinstance(e, task_cancel.TaskCancelled):
+                    # 用户主动取消：状态置为 cancelled，token 消耗已在中止点回写
+                    await task_service.update_task_progress(
+                        async_task_id, stage="cancelled", status="cancelled",
+                        error=e.reason, finished_at=datetime.now(timezone.utc),
+                        tokens_in=e.tokens_in, tokens_out=e.tokens_out,
+                    )
+                    return {"created": 0, "skipped": 0, "cancelled": True, "chunks": n}
                 await task_service.update_task_progress(
                     async_task_id, stage="failed", status="failed",
                     error=to_user_error(e), finished_at=datetime.now(timezone.utc),

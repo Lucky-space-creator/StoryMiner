@@ -19,8 +19,9 @@ from db import get_session
 from auth.jwt import get_current_user
 from common.response import success, paginate
 from common.exceptions import BizError
+from common import task_queue
 from schemas.novel import NovelCreate, NovelUpdate, ChapterCorrect, ChapterSplit, ChapterMerge
-from services import novel_service, parse_service, kb_service
+from services import novel_service, parse_service, kb_service, chapter_analysis_service, task_service
 from repositories import novel_repo
 
 router = APIRouter(prefix="/novels", tags=["novels"])
@@ -148,3 +149,57 @@ async def merge_chapters(
 ):
     """合并多个章节（M1.4）。"""
     return success(await novel_service.merge_chapters(session, user.id, data.chapter_ids))
+
+
+# ---------------------------------------------------------------------------
+# 章节解析（LLM 驱动的章节结构化分析）
+# ---------------------------------------------------------------------------
+@router.post("/{novel_id}/chapters/analyze")
+async def trigger_chapter_analysis(
+    novel_id: int,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    session=Depends(get_session),
+):
+    """触发章节解析异步任务：LLM 分析小说整体结构 + 逐章生成摘要/事件/人物等信息。
+
+    整体思路：
+        创建 chapter_analysis 类型的异步任务，将 LLM 分析工作交给后台协程执行，
+        前端通过 /tasks/{task_id} 或仪表盘轮询进度。
+
+    关键点：
+        1. 需小说下有章节数据，否则返回错误提示。
+        2. 同一小说可多次触发，每次覆盖之前的分析结果（幂等写入 extra 字段）。
+        3. 返回 task_id 供前端跳转仪表盘查看进度。
+    """
+    novel = await novel_repo.get_novel(session, user.id, novel_id)
+    if not novel:
+        raise BizError(404, "小说不存在")
+    # 创建异步任务
+    task = await task_service.create_task(
+        session, user.id, type="chapter_analysis",
+        name=f"章节解析·{novel.name}", novel_id=novel_id,
+    )
+    # 提交后台任务（入全局串行队列，逐一执行；排队中前端显示「排队中」）
+    task_queue.submit(
+        chapter_analysis_service.analyze_chapters,
+        novel_id=novel_id, owner_id=user.id,
+        novel_name=novel.name, summary=novel.summary or "",
+        async_task_id=task.id,
+    )
+    return success({"task_id": task.id, "novel_id": novel_id}, "章节解析任务已启动")
+
+
+@router.get("/{novel_id}/chapter-analysis")
+async def get_chapter_analysis(
+    novel_id: int,
+    user: User = Depends(get_current_user),
+    session=Depends(get_session),
+):
+    """获取小说章节分析结果：包含整体结构分析 + 各章摘要/事件/人物等。
+
+    返回：
+        {structure: {...}, chapters: [{id, title, chapter_no, analysis: {...}}, ...]}
+    """
+    result = await chapter_analysis_service.get_chapter_analysis(session, user.id, novel_id)
+    return success(result)

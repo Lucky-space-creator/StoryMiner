@@ -23,6 +23,7 @@ from models.graph import Entity, Relation
 from repositories import graph_repo, novel_repo, llm_repo
 from services import llm_adapters, task_service
 from common import crypto
+from common import task_cancel
 from common.exceptions import BizError
 
 # 实体类型 → 中文类别（前端图例/着色用）
@@ -135,9 +136,16 @@ async def run_extract(novel_id: int, owner_id: int, task_id: int | None = None) 
     async with SessionLocal() as session:
         try:
             if task_id:
+                if task_cancel.is_cancelled(task_id):
+                    await task_service.update_task_progress(task_id, stage="cancelled", status="cancelled", error="用户主动取消任务", finished_at=datetime.now(timezone.utc))
+                    return
                 await task_service.update_task_progress(task_id, stage="extracting", progress=20, status="running", started_at=datetime.now(timezone.utc))
             result = await extract(session, novel_id, owner_id)
             if task_id:
+                # 收尾前确认是否被取消（单次大模型调用不可中断，此处兜底防状态回退）
+                if task_cancel.is_cancelled(task_id):
+                    await task_service.update_task_progress(task_id, stage="cancelled", status="cancelled", error="用户主动取消任务", finished_at=datetime.now(timezone.utc))
+                    return
                 await task_service.update_task_progress(
                     task_id, stage="done", progress=100, status="success", finished_at=datetime.now(timezone.utc),
                     entity_count=result.get("entity_count", 0), relation_count=result.get("relation_count", 0),
@@ -145,7 +153,10 @@ async def run_extract(novel_id: int, owner_id: int, task_id: int | None = None) 
             print(f"[graph] 抽取完成 novel={novel_id} {result}")
         except Exception as e:  # 后台任务异常不应影响主流程
             if task_id:
-                await task_service.update_task_progress(task_id, stage="failed", status="failed", error=str(e), finished_at=datetime.now(timezone.utc))
+                if isinstance(e, task_cancel.TaskCancelled):
+                    await task_service.update_task_progress(task_id, stage="cancelled", status="cancelled", error=e.reason, finished_at=datetime.now(timezone.utc))
+                else:
+                    await task_service.update_task_progress(task_id, stage="failed", status="failed", error=str(e), finished_at=datetime.now(timezone.utc))
             print(f"[graph] 抽取失败 novel={novel_id}: {e}")
 
 

@@ -124,16 +124,34 @@ async def get_model_stats(session: AsyncSession, owner_id: int) -> list[dict]:
     ]
 
 
-async def get_task_overview(session: AsyncSession, owner_id: int) -> dict:
-    """异步任务进度总览（M14.1）：汇总当前用户所有统一异步任务及状态计数。"""
-    items = (await session.execute(
-        select(AsyncTask).where(AsyncTask.owner_id == owner_id).order_by(AsyncTask.id.desc())
+async def get_task_overview(
+    session: AsyncSession, owner_id: int, *,
+    status: str | None = None, type: str | None = None,
+    novel_name: str | None = None, completed: bool | None = None,
+    page: int = 1, page_size: int = 20,
+) -> dict:
+    """异步任务进度总览（M14.1）：分页 + 条件查询任务列表 + 状态计数。
+
+    关键点：
+        1. 任务列表走 query_tasks，支持状态/类型/是否完成/小说名模糊与分页。
+        2. summary 仍按该用户全部任务汇总（不受当前筛选影响），保持仪表盘概览稳定。
+    """
+    result = await task_service.query_tasks(
+        session, owner_id, status=status, type=type,
+        novel_name=novel_name, completed=completed, page=page, page_size=page_size,
+    )
+    # 汇总计数按全量任务（未筛选），与分页列表解耦
+    all_rows = (await session.execute(
+        select(AsyncTask).where(AsyncTask.owner_id == owner_id)
     )).scalars().all()
-    tasks = [task_service._out(t) for t in items]
     summary = {
-        "total": len(tasks),
-        "running": sum(1 for t in tasks if t["status"] == "running"),
-        "success": sum(1 for t in tasks if t["status"] == "success"),
-        "failed": sum(1 for t in tasks if t["status"] == "failed"),
+        "total": len(all_rows),
+        "running": sum(1 for t in all_rows if t.status == "running"),
+        "success": sum(1 for t in all_rows if t.status == "success"),
+        "failed": sum(1 for t in all_rows if t.status == "failed"),
+        "cancelled": sum(1 for t in all_rows if t.status == "cancelled"),
     }
-    return {"tasks": tasks, "summary": summary}
+    return {
+        "tasks": result["items"], "summary": summary,
+        "total": result["total"], "page": result["page"], "page_size": result["page_size"],
+    }

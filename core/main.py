@@ -80,6 +80,28 @@ async def lifespan(app: FastAPI):
             await conn.execute(text("ALTER TABLE story_novel ADD COLUMN IF NOT EXISTS ai_summary TEXT"))
         except Exception:
             pass
+        # V12：异步任务取消 + Token 消耗记录（story_async_task.tokens_in/tokens_out）。
+        # create_all 不会给已存在的表加列，显式 ALTER 补齐（幂等）。
+        try:
+            from sqlalchemy import text
+            await conn.execute(text(
+                "ALTER TABLE story_async_task ADD COLUMN IF NOT EXISTS tokens_in INTEGER NOT NULL DEFAULT 0"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE story_async_task ADD COLUMN IF NOT EXISTS tokens_out INTEGER NOT NULL DEFAULT 0"
+            ))
+        except Exception:
+            pass
+        # 清理上次进程遗留的僵尸任务：内存队列随重启清空，DB 中残留的 running/pending
+        # 任务不会再被执行，标记为 failed，避免前端一直显示「进行中/排队中」。
+        try:
+            from sqlalchemy import text
+            await conn.execute(text(
+                "UPDATE story_async_task SET status='failed', error='服务重启，任务已中断' "
+                "WHERE status='running'"
+            ))
+        except Exception:
+            pass
     async with SessionLocal() as s:
         await skill_service.seed_builtin(s)
     # 确保对象存储桶存在（MinIO 后端；失败仅告警不阻断启动）
@@ -88,8 +110,15 @@ async def lifespan(app: FastAPI):
         await ensure_storage()
     except Exception as e:  # noqa: BLE001
         print("[warn] 存储初始化失败:", e)
+    # 启动全局串行任务队列 worker：所有后台任务逐一排队执行
+    from common import task_queue
+    task_queue.start_worker()
     yield
-    # 进程退出时优雅关闭后台线程池，避免线程悬挂
+    # 进程退出时优雅关闭：停止串行队列 worker + 后台线程池
+    try:
+        await task_queue.stop_worker()
+    except Exception:
+        pass
     try:
         from common.threadpool import shutdown
         shutdown()

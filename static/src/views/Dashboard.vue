@@ -35,7 +35,25 @@
           <span class="text-muted">进行中 <b class="text-amber-500">{{ taskSummary.running }}</b></span>
           <span class="text-muted">成功 <b class="text-emerald-600">{{ taskSummary.success }}</b></span>
           <span class="text-muted">失败 <b class="text-red-600">{{ taskSummary.failed }}</b></span>
+          <span class="text-muted">已取消 <b class="text-stone-500">{{ taskSummary.cancelled }}</b></span>
         </div>
+      </div>
+      <div class="flex flex-wrap items-center gap-2 mb-3">
+        <input
+          v-model="filters.novelName" @keyup.enter="onSearch"
+          placeholder="小说名模糊查询" 
+          class="text-sm border border-stone-200 rounded px-2 py-1 bg-surface text-app outline-none focus:border-teal-400 w-44"
+        />
+        <select
+          v-model="filters.completed" @change="onSearch"
+          class="text-sm border border-stone-200 rounded px-2 py-1 bg-surface text-app outline-none focus:border-teal-400"
+        >
+          <option value="">全部状态</option>
+          <option value="false">进行中</option>
+          <option value="true">已完成</option>
+        </select>
+        <Button size="sm" @click="onSearch">查询</Button>
+        <Button size="sm" variant="ghost" @click="onReset">重置</Button>
       </div>
       <div class="space-y-2">
         <div v-for="t in tasks" :key="t.id" class="border border-stone-200 rounded p-3 cursor-pointer hover:border-teal-400 transition" @click="openDetail(t)">
@@ -57,8 +75,21 @@
             <div class="h-full bg-teal-600 transition-all" :style="{ width: t.progress + '%' }"></div>
           </div>
           <p v-if="t.error" class="mt-1 text-xs text-red-600 truncate" :title="t.error">{{ t.error }}</p>
+          <p v-if="t.tokens_in || t.tokens_out" class="mt-1 text-xs text-muted">Token：{{ t.tokens_in }} 入 / {{ t.tokens_out }} 出</p>
+          <div class="mt-2 flex justify-end">
+            <Button v-if="t.status === 'running'" size="sm" variant="ghost" :disabled="cancelling[t.id]" @click.stop="onCancel(t)">
+              {{ cancelling[t.id] ? '取消中…' : '取消任务' }}
+            </Button>
+          </div>
         </div>
-        <p v-if="!tasks.length" class="text-sm text-muted text-center py-4">暂无异步任务</p>
+          <p v-if="!tasks.length" class="text-sm text-muted text-center py-4">暂无异步任务</p>
+      </div>
+      <div v-if="total > 0" class="flex items-center justify-between mt-3 text-sm">
+        <span class="text-muted">共 {{ total }} 条 · 第 {{ page }}/{{ totalPages }} 页</span>
+        <div class="flex gap-2">
+          <Button size="sm" variant="ghost" :disabled="page <= 1" @click="prevPage">上一页</Button>
+          <Button size="sm" variant="ghost" :disabled="page >= totalPages" @click="nextPage">下一页</Button>
+        </div>
       </div>
     </Card>
 
@@ -68,6 +99,7 @@
           <div><p class="text-muted">状态</p><p :class="statusClass(selectedTask.status)">{{ statusLabel(selectedTask.status) }}</p></div>
           <div><p class="text-muted">阶段</p><p class="text-app">{{ stageLabel(selectedTask.stage) }}</p></div>
           <div><p class="text-muted">进度</p><p class="text-app">{{ selectedTask.progress }}%</p></div>
+          <div><p class="text-muted">Token 消耗</p><p class="text-app">{{ (selectedTask.tokens_in || 0) }} 入 / {{ (selectedTask.tokens_out || 0) }} 出</p></div>
         </div>
         <div class="h-2 bg-stone-100 rounded overflow-hidden">
           <div class="h-full bg-teal-600 transition-all" :style="{ width: selectedTask.progress + '%' }"></div>
@@ -87,25 +119,82 @@
         <Button v-if="selectedTask.status === 'failed' && selectedTask.type === 'parse'" :disabled="retrying" @click="onRetry(selectedTask.id)">
           {{ retrying ? '重试中…' : '一键重试' }}
         </Button>
+        <Button v-if="selectedTask.status === 'running'" variant="ghost" :disabled="cancelling[selectedTask.id]" @click="onCancel(selectedTask)">
+          {{ cancelling[selectedTask.id] ? '取消中…' : '取消任务' }}
+        </Button>
       </div>
     </Drawer>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import * as echarts from 'echarts'
 import Card from '@/components/ui/Card.vue'
 import Drawer from '@/components/ui/Drawer.vue'
 import Button from '@/components/ui/Button.vue'
 import { getStats, getTokenUsage, getTokenTrend, getModelStats, getTaskOverview } from '@/api/dashboard'
 import { retryParseTask } from '@/api/parseTasks'
+import { cancelTask } from '@/api/tasks'
 import { typeText } from '@/utils/taskStages'
 
 const statCards = ref([])
 const usage = ref({ tokensIn: 0, tokensOut: 0, calls: 0, cost: 0 })
 const tasks = ref([])
-const taskSummary = ref({ total: 0, running: 0, success: 0, failed: 0 })
+const taskSummary = ref({ total: 0, running: 0, success: 0, failed: 0, cancelled: 0 })
+const cancelling = ref({})
+
+// 任务列表筛选与分页
+const filters = ref({ novelName: '', completed: '' })
+const page = ref(1)
+const pageSize = ref(10)
+const total = ref(0)
+const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)))
+
+async function onCancel(t) {
+  cancelling.value[t.id] = true
+  try {
+    await cancelTask(t.id)
+    await refreshTasks()
+  } finally {
+    cancelling.value[t.id] = false
+  }
+}
+
+async function refreshTasks() {
+  const params = { page: page.value, page_size: pageSize.value }
+  if (filters.value.novelName.trim()) params.novel_name = filters.value.novelName.trim()
+  if (filters.value.completed !== '') params.completed = filters.value.completed === 'true'
+  const res = await getTaskOverview(params)
+  tasks.value = res.data.tasks || []
+  taskSummary.value = res.data.summary || { total: 0, running: 0, success: 0, failed: 0, cancelled: 0 }
+  total.value = res.data.total || 0
+}
+
+function onSearch() {
+  page.value = 1
+  refreshTasks()
+}
+
+function onReset() {
+  filters.value = { novelName: '', completed: '' }
+  page.value = 1
+  refreshTasks()
+}
+
+function prevPage() {
+  if (page.value > 1) {
+    page.value -= 1
+    refreshTasks()
+  }
+}
+
+function nextPage() {
+  if (page.value < totalPages.value) {
+    page.value += 1
+    refreshTasks()
+  }
+}
 const drawerVisible = ref(false)
 const selectedTask = ref(null)
 const retrying = ref(false)
@@ -133,23 +222,19 @@ async function onRetry(taskId) {
   }
 }
 
-async function refreshTasks() {
-  const res = await getTaskOverview()
-  tasks.value = res.data.tasks || []
-  taskSummary.value = res.data.summary || { total: 0, running: 0, success: 0, failed: 0 }
-}
-
 const STAGE_LABEL = {
   pending: '排队中', preparing: '准备中', parsing: '解析中', splitting: '切章中',
   chunking: '切分文档', embedding: '向量化中', storing: '写入索引',
   extracting: '抽取实体中', generating: '生成小传中', done: '已完成', failed: '失败',
+  cancelled: '已取消',
 }
-const STATUS_LABEL = { running: '进行中', success: '成功', failed: '失败' }
+const STATUS_LABEL = { running: '进行中', success: '成功', failed: '失败', cancelled: '已取消' }
 function stageLabel(s) { return STAGE_LABEL[s] || s || '未知' }
 function statusLabel(s) { return STATUS_LABEL[s] || s || '未知' }
 function statusClass(s) {
   if (s === 'success') return 'text-emerald-600'
   if (s === 'failed') return 'text-red-600'
+  if (s === 'cancelled') return 'text-stone-500'
   return 'text-amber-500'
 }
 function fmt(iso) {
@@ -191,8 +276,8 @@ function resize() {
 }
 
 onMounted(async () => {
-  const [stats, usageRes, trend, models, taskRes] = await Promise.all([
-    getStats(), getTokenUsage(), getTokenTrend(), getModelStats(), getTaskOverview()
+  const [stats, usageRes, trend, models] = await Promise.all([
+    getStats(), getTokenUsage(), getTokenTrend(), getModelStats()
   ])
   const s = stats.data
   statCards.value = [
@@ -204,8 +289,7 @@ onMounted(async () => {
   usage.value = usageRes.data
   renderTrend(trend.data)
   renderModel(models.data)
-  tasks.value = taskRes.data.tasks || []
-  taskSummary.value = taskRes.data.summary || { total: 0, running: 0, success: 0, failed: 0 }
+  await refreshTasks()
   window.addEventListener('resize', resize)
   // 每 5s 刷新异步任务总览（进行中任务进度/状态实时更新）
   taskTimer = setInterval(refreshTasks, 5000)

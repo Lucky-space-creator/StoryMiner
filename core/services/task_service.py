@@ -15,7 +15,7 @@
 """
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.async_task import AsyncTask
@@ -44,6 +44,7 @@ async def update_task_progress(
     task_id: int, stage: str | None = None, progress: int | None = None,
     status: str | None = None, error: str | None = None,
     started_at: datetime | None = None, finished_at: datetime | None = None,
+    tokens_in: int | None = None, tokens_out: int | None = None,
     **extra,
 ) -> AsyncTask | None:
     """后台任务进度回写：独立会话更新，避免持有请求会话。"""
@@ -63,6 +64,10 @@ async def update_task_progress(
             t.started_at = started_at
         if finished_at is not None:
             t.finished_at = finished_at
+        if tokens_in is not None:
+            t.tokens_in = tokens_in
+        if tokens_out is not None:
+            t.tokens_out = tokens_out
         if extra:
             t.extra = {**(t.extra or {}), **extra}
         await session.commit()
@@ -72,7 +77,6 @@ async def update_task_progress(
 async def get_task(session: AsyncSession, task_id: int) -> AsyncTask | None:
     """按 id 取任务（调用方负责归属校验）。"""
     return await session.get(AsyncTask, task_id)
-
 
 async def list_tasks(
     session: AsyncSession, owner_id: int,
@@ -94,6 +98,40 @@ async def list_running(session: AsyncSession, owner_id: int) -> list[dict]:
     return await list_tasks(session, owner_id, status="running")
 
 
+async def query_tasks(
+    session: AsyncSession, owner_id: int,
+    status: str | None = None, type: str | None = None,
+    novel_name: str | None = None, completed: bool | None = None,
+    page: int = 1, page_size: int = 20,
+) -> dict:
+    """分页 + 条件查询统一异步任务（按 owner 隔离）。
+
+    条件：
+        1. status 精确匹配（running/success/failed/cancelled）。
+        2. type 精确匹配（parse/chunk/graph/character）。
+        3. completed 布尔：True=已结束(非 running)，False=进行中。
+        4. novel_name 小说名模糊匹配（ILIKE %kw%），按 novel_id 关联 story_novel。
+    返回 {items, total, page, page_size}，供仪表盘与前端分页展示。
+    """
+    from models.novel_content import Novel
+    base = select(AsyncTask).where(AsyncTask.owner_id == owner_id)
+    if status:
+        base = base.where(AsyncTask.status == status)
+    if type:
+        base = base.where(AsyncTask.type == type)
+    if completed is not None:
+        base = base.where(AsyncTask.status != "running" if completed else AsyncTask.status == "running")
+    if novel_name:
+        base = base.join(Novel, Novel.id == AsyncTask.novel_id).where(Novel.name.ilike(f"%{novel_name}%"))
+    total = (await session.execute(base.with_only_columns(func.count()))).scalar() or 0
+    page = max(1, int(page))
+    page_size = max(1, min(int(page_size), 200))
+    rows = (await session.execute(
+        base.order_by(AsyncTask.id.desc()).offset((page - 1) * page_size).limit(page_size)
+    )).scalars().all()
+    return {"items": [_out(t) for t in rows], "total": total, "page": page, "page_size": page_size}
+
+
 def _out(t: AsyncTask) -> dict:
     """任务出参：统一结构，前端直接消费。"""
     return {
@@ -102,6 +140,7 @@ def _out(t: AsyncTask) -> dict:
         "doc_id": t.doc_id, "target_id": t.target_id,
         "stage": t.stage, "progress": t.progress, "status": t.status,
         "error": t.error,
+        "tokens_in": t.tokens_in or 0, "tokens_out": t.tokens_out or 0,
         "started_at": t.started_at.isoformat() if t.started_at else None,
         "finished_at": t.finished_at.isoformat() if t.finished_at else None,
         "created_at": t.created_at.isoformat() if t.created_at else None,

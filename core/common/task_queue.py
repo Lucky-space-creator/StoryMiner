@@ -1,0 +1,82 @@
+"""
+全局串行任务队列（所有后台异步任务共享）
+
+整体思路：
+    用一个进程内 asyncio.Queue + 单个 worker 协程，把所有耗时后台任务（解析/切割/
+    图谱/人物/章节解析等）改为「逐一排队、顺序执行」，同一时刻只跑一个，避免并发
+    造成的 LLM 限流、资源争用与进度混乱。排队中的任务在 DB 中保持 stage="pending"，
+    前端据此显示「排队中」。
+
+关键点：
+    1. 队列与 worker 必须在事件循环内创建/启动（延迟初始化）。
+    2. submit 为同步入队（put_nowait），路由/服务无需 await，快速返回。
+    3. worker 逐一取出任务执行，单个任务异常不影响后续任务（兜底 try/except）。
+    4. 任务函数内部自行回写 DB 进度；本模块只负责调度顺序，不感知业务细节。
+
+实现逻辑：
+    start_worker 在应用启动时创建长驻 worker；submit 把 (func, args, kwargs) 放入队列；
+    worker 循环 await queue.get() 后 await func(*args, **kwargs)。
+"""
+import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
+
+# 进程内单例队列与 worker，延迟到事件循环内初始化
+_queue: "asyncio.Queue | None" = None
+_worker_task: "asyncio.Task | None" = None
+
+
+def _get_queue() -> asyncio.Queue:
+    """获取（或惰性创建）全局任务队列。"""
+    global _queue
+    if _queue is None:
+        _queue = asyncio.Queue()
+    return _queue
+
+
+def submit(func, *args, **kwargs) -> None:
+    """将一个 async 任务函数入队，等待串行执行（同步入队，立即返回）。
+
+    参数：
+        func: 待执行的协程函数（async def）。
+        *args/**kwargs: 传给 func 的参数。
+    """
+    _get_queue().put_nowait((func, args, kwargs))
+    logger.info("任务入队，当前队列积压 %d 个", _get_queue().qsize())
+
+
+async def _worker() -> None:
+    """常驻 worker：逐一取出任务并顺序执行，单任务异常不影响后续。"""
+    q = _get_queue()
+    logger.info("串行任务队列 worker 已启动")
+    while True:
+        func, args, kwargs = await q.get()
+        try:
+            await func(*args, **kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.error("串行任务执行异常: %s", e, exc_info=True)
+        finally:
+            q.task_done()
+
+
+def start_worker() -> "asyncio.Task":
+    """启动常驻 worker（幂等：已在运行则复用）。应在应用启动时调用。"""
+    global _worker_task
+    if _worker_task is None or _worker_task.done():
+        _worker_task = asyncio.create_task(_worker())
+    return _worker_task
+
+
+async def stop_worker() -> None:
+    """停止 worker（应用关闭时调用）。"""
+    global _worker_task
+    if _worker_task is not None:
+        _worker_task.cancel()
+        try:
+            await _worker_task
+        except asyncio.CancelledError:
+            pass
+        _worker_task = None
