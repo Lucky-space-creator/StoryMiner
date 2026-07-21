@@ -12,7 +12,7 @@ core/test_dash.cmd
 # API 目录
 API/
 # bug 与潜在需求分析
-bug和潜在需求分析
+bug和潜在需求分析.txt
 # 日志
 *.log
 

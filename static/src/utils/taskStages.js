@@ -3,6 +3,7 @@
 export const STAGE_TEXT = {
   pending: '排队中',
   preparing: '准备中',
+  clearing: '清空旧数据中',
   parsing: '解析中',
   splitting: '切章中',
   chunking: '切分文档',
@@ -18,6 +19,11 @@ export const STAGE_TEXT = {
 }
 
 export function stageText(s) {
+  // V13: 支持 extracting_N/M 格式 "正在抽取第N/M块"
+  if (s && s.startsWith('extracting_')) {
+    const parts = s.replace('extracting_', '').split('/')
+    if (parts.length === 2) return `正在抽取第${parts[0]}/${parts[1]}块`
+  }
   return STAGE_TEXT[s] || s || '处理中'
 }
 

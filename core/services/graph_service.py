@@ -3,18 +3,23 @@
 
 整体思路：
     封装两类能力：(1) 图谱查询，将实体/关系组装为前端 ECharts 所需的
-    {nodes, links, categories} 结构；(2) 实体关系抽取，调用本地 Ollama 大模型
-    从章节文本中抽取实体与关系并幂等落库。
+    {nodes, links, categories} 结构；(2) 实体关系抽取，调用 LLM 从章节文本中
+    抽取7种实体类型与关系，支持分块抽取与先删后建策略。
 
 关键点：
-    1. 实体按 (novel_id, name, type) 去重；关系按 (source_id, target_id, type) 去重，重复抽取不翻倍。
-    2. 抽取为耗时操作，run_extract 作为后台任务自开会话落库，避免阻塞 HTTP 请求。
-    3. 大模型输出做容错解析（去 markdown 包裹、截取 JSON 片段），失败不中断整体流程。
+    1. V13 扩展实体类型为7种：character(人物)/place(地点)/org(组织)/
+       time_period(时间)/event(事件)/item(物品)/concept(概念)。
+    2. 抽取采用「先删后建」策略：每次抽取前物理删除该小说全部现有实体与关系，
+       然后重新创建导入，避免旧数据污染。
+    3. 大文本采用分块策略：超过8000字符时按块切分，逐块抽取并合并去重。
+    4. run_extract 作为后台任务自开会话落库，进度分阶段回写。
 
 实现逻辑：
-    get_graph 批量取实体/关系并按度数计算节点权重；extract 拼文本→调 chat→解析→upsert。
+    get_graph 批量取实体/关系并按度数计算节点权重；
+    extract 先删后建→分块拼文本→逐块调 chat→合并解析→批量 upsert 落库。
 """
 import json
+import re
 
 from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,21 +31,73 @@ from common import crypto
 from common import task_cancel
 from common.exceptions import BizError
 
+# ───────────────────────────── 实体类型定义（V13 扩展为7种） ─────────────────────────────
+
 # 实体类型 → 中文类别（前端图例/着色用）
-_TYPE_CN = {"character": "人物", "place": "地点", "org": "组织"}
-
-# 抽取提示词模板：约束实体类型与 JSON 输出格式
-_PROMPT = """你是一个小说知识图谱抽取引擎，请从给定文本中抽取实体与关系。
-实体类型仅限：character(人物)、place(地点)、org(组织)。
-关系类型自由发挥，使用中文短语描述两者关系（如：师徒、父子、夫妻、朋友、敌对、主仆、爱慕、同门、上下级、亲属）。
-仅输出一个 JSON 对象，不要包含任何解释或 markdown 标记，格式严格如下：
-{
-  "entities": [{"name":"张三","type":"character","profile":{"身份":"主角","性格":"坚毅"}}],
-  "relations": [{"source":"张三","target":"李四","type":"师徒","evidence":"张三拜李四为师"}]
+_TYPE_CN = {
+    "character": "人物",
+    "place": "地点",
+    "org": "组织",
+    "time_period": "时间",
+    "event": "事件",
+    "item": "物品",
+    "concept": "概念",
 }
-待抽取文本：
-{text}"""
 
+# 有效的实体类型白名单
+_VALID_ENTITY_TYPES = frozenset(_TYPE_CN.keys())
+
+# 实体类型默认颜色（与 story_entity_type 种子数据一致）
+_TYPE_COLORS = {
+    "character": "#0d9488",
+    "place": "#6366f1",
+    "org": "#d97706",
+    "time_period": "#8b5cf6",
+    "event": "#dc2626",
+    "item": "#16a34a",
+    "concept": "#0891b2",
+}
+
+# 分块抽取参数
+_CHUNK_SIZE = 8000     # 每块最大字符数
+_CHUNK_OVERLAP = 500   # 块间重叠字符数
+
+# ───────────────────────────── 抽取 Prompt（V13 重设计：7种实体类型 + 详细约束） ─────────────────────────────
+
+_EXTRACT_SYSTEM = """你是一个专业的小说知识图谱抽取引擎，请严格按以下规范从文本中抽取实体与关系。
+
+## 实体类型定义（共7种，必须使用指定 code）
+
+1. **character（人物）**：小说中登场的人物角色，含主角、配角、龙套、提到名字但未出场的历史/传说人物
+2. **place（地点）**：场景、地理位置、建筑、城池、国家、区域、洞府、秘境
+3. **org（组织）**：帮派、宗门、势力、家族、王朝、机构、队伍
+4. **time_period（时间）**：具体时间点、时间段、历史时期、朝代纪年、人物年龄、事件持续时长
+5. **event（事件）**：发生的重要事件、情节转折、战斗、会议、仪式、比武、突破、死亡
+6. **item（物品）**：重要道具、武器、法宝、丹药、秘籍、信物、货币、材料
+7. **concept（概念）**：功法体系、修炼境界、世界观设定、特殊规则、文化概念、种族
+
+## 抽取规范
+- name 必须使用原文中的准确名称，不要杜撰
+- profile 为 JSON 对象，记录关键属性（如：{"身份":"主角","性别":"男","境界":"筑基期"}）
+- description 用一句简短中文概括该实体在原文中的作用
+- 每个实体至少要有一个有意义的关系连接，孤立节点可忽略
+
+## 输出格式
+严格输出一个 JSON 对象，不要包含任何解释或 markdown 标记：
+{
+  "entities": [
+    {"name":"张三","type":"character","profile":{"身份":"主角"},"description":"小说主人公"},
+    {"name":"天剑宗","type":"org","profile":{"类型":"宗门"},"description":"主角所在宗门"}
+  ],
+  "relations": [
+    {"source":"张三","target":"天剑宗","type":"所属宗门","evidence":"原文证据句"}
+  ]
+}"""
+
+_EXTRACT_USER = "请从以下小说文本中抽取所有实体和关系（共7种类型：character/place/org/time_period/event/item/concept）：\n\n{text}"
+
+
+# ───────────────────────────── LLM 适配器 ─────────────────────────────
 
 async def _get_chat_adapter(session: AsyncSession, owner_id: int):
     """取默认对话模型适配器（M9 分发链），返回 (adapter, model_name)。"""
@@ -51,114 +108,7 @@ async def _get_chat_adapter(session: AsyncSession, owner_id: int):
     return llm_adapters.get_adapter(cfg, crypto.decrypt(cfg.api_key)), cfg.model
 
 
-async def get_graph(session: AsyncSession, novel_id: int, owner_id: int) -> dict:
-    """图谱查询（M5.1）：组装 ECharts 所需的节点/边/类别。
-
-    实现逻辑：批量取实体与关系，按度数计算节点权重，实体类型映射中文类别。
-    """
-    entities = await graph_repo.list_entities(session, novel_id)
-    relations = await graph_repo.list_relations(session, novel_id)
-    degree: dict[int, int] = {}
-    for r in relations:
-        degree[r.source_id] = degree.get(r.source_id, 0) + 1
-        degree[r.target_id] = degree.get(r.target_id, 0) + 1
-    categories: list[str] = []
-    nodes = []
-    for e in entities:
-        cat = _TYPE_CN.get(e.type, e.type)
-        if cat not in categories:
-            categories.append(cat)
-        nodes.append({
-            "id": e.id, "name": e.name, "category": cat,
-            "value": degree.get(e.id, 0), "type": e.type,
-        })
-    links = [{"source": r.source_id, "target": r.target_id, "label": r.type} for r in relations]
-    return {"nodes": nodes, "links": links, "categories": categories}
-
-
-async def list_relation_types(session: AsyncSession, owner_id: int) -> list:
-    """关系类型字典（M5.3）：系统内置 + 本人自定义。"""
-    return await graph_repo.list_relation_types(session, owner_id)
-
-
-async def extract(session: AsyncSession, novel_id: int, owner_id: int) -> dict:
-    """实体关系抽取（M5.2）：LLM 抽取并幂等落库，返回新增统计。"""
-    chapters = await novel_repo.list_all_chapters(session, novel_id)
-    if not chapters:
-        raise BizError(400, "该小说暂无章节，无法抽取")
-    text = "\n".join(c.content for c in chapters)[:12000]
-    adapter, _ = await _get_chat_adapter(session, owner_id)
-    raw = await adapter.chat([{"role": "user", "content": _PROMPT.replace("{text}", text)}])
-    data = _parse_json(raw)
-
-    ent_count = 0
-    for ed in data.get("entities", []):
-        name = (ed.get("name") or "").strip()
-        if not name:
-            continue
-        etype = ed.get("type", "character") or "character"
-        if etype not in ("character", "place", "org"):
-            etype = "character"
-        if await graph_repo.get_entity(session, novel_id, name, etype):
-            continue
-        await graph_repo.create_entity(session, Entity(
-            novel_id=novel_id, owner_id=owner_id, name=name, type=etype,
-            profile=ed.get("profile") or {}, description=ed.get("description"),
-        ))
-        ent_count += 1
-
-    ents = await graph_repo.list_entities(session, novel_id)
-    emap = {(e.name, e.type): e.id for e in ents}
-    rel_count = 0
-    for rd in data.get("relations", []):
-        sname, tname, rtype = (rd.get("source") or "").strip(), (rd.get("target") or "").strip(), (rd.get("type") or "").strip()
-        if not (sname and tname and rtype):
-            continue
-        sid = emap.get((sname, "character")) or emap.get((sname, "place")) or emap.get((sname, "org"))
-        tid = emap.get((tname, "character")) or emap.get((tname, "place")) or emap.get((tname, "org"))
-        if not (sid and tid):
-            continue
-        if await graph_repo.get_relation(session, sid, tid, rtype):
-            continue
-        await graph_repo.create_relation(session, Relation(
-            novel_id=novel_id, owner_id=owner_id, source_id=sid, target_id=tid,
-            type=rtype, evidence=rd.get("evidence"),
-        ))
-        rel_count += 1
-
-    await session.commit()
-    return {"entity_count": ent_count, "relation_count": rel_count}
-
-
-async def run_extract(novel_id: int, owner_id: int, task_id: int | None = None) -> None:
-    """后台抽取入口：自开会话调用 extract，进度回写统一任务，异常仅记录不抛出。"""
-    from db import SessionLocal
-    async with SessionLocal() as session:
-        try:
-            if task_id:
-                if task_cancel.is_cancelled(task_id):
-                    await task_service.update_task_progress(task_id, stage="cancelled", status="cancelled", error="用户主动取消任务", finished_at=datetime.now(timezone.utc))
-                    return
-                await task_service.update_task_progress(task_id, stage="extracting", progress=20, status="running", started_at=datetime.now(timezone.utc))
-            result = await extract(session, novel_id, owner_id)
-            if task_id:
-                # 收尾前确认是否被取消（单次大模型调用不可中断，此处兜底防状态回退）
-                if task_cancel.is_cancelled(task_id):
-                    await task_service.update_task_progress(task_id, stage="cancelled", status="cancelled", error="用户主动取消任务", finished_at=datetime.now(timezone.utc))
-                    return
-                await task_service.update_task_progress(
-                    task_id, stage="done", progress=100, status="success", finished_at=datetime.now(timezone.utc),
-                    entity_count=result.get("entity_count", 0), relation_count=result.get("relation_count", 0),
-                )
-            print(f"[graph] 抽取完成 novel={novel_id} {result}")
-        except Exception as e:  # 后台任务异常不应影响主流程
-            if task_id:
-                if isinstance(e, task_cancel.TaskCancelled):
-                    await task_service.update_task_progress(task_id, stage="cancelled", status="cancelled", error=e.reason, finished_at=datetime.now(timezone.utc))
-                else:
-                    await task_service.update_task_progress(task_id, stage="failed", status="failed", error=str(e), finished_at=datetime.now(timezone.utc))
-            print(f"[graph] 抽取失败 novel={novel_id}: {e}")
-
+# ───────────────────────────── JSON 解析 ─────────────────────────────
 
 def _parse_json(raw: str) -> dict:
     """容错解析 LLM 输出的 JSON（去 markdown 包裹、截取首尾花括号）。"""
@@ -174,3 +124,419 @@ def _parse_json(raw: str) -> dict:
         return json.loads(raw)
     except Exception:
         return {}
+
+
+def _normalize_type(etype: str) -> str:
+    """规范化实体类型：不在白名单内的默认归为 character。"""
+    etype = (etype or "character").strip().lower()
+    if etype not in _VALID_ENTITY_TYPES:
+        # 尝试模糊匹配
+        fuzzy_map = {
+            "person": "character", "people": "character", "人": "character", "角色": "character",
+            "location": "place", "位置": "place", "场景": "place",
+            "organization": "org", "组织": "org", "势力": "org", "帮派": "org",
+            "time": "time_period", "时间": "time_period", "时期": "time_period", "时代": "time_period",
+            "事件": "event", "情节": "event",
+            "object": "item", "物品": "item", "道具": "item", "武器": "item",
+            "概念": "concept", "设定": "concept",
+        }
+        etype = fuzzy_map.get(etype, "character")
+    return etype
+
+
+# ───────────────────────────── 文本分块 ─────────────────────────────
+
+def _split_text(text: str, chunk_size: int = _CHUNK_SIZE, overlap: int = _CHUNK_OVERLAP) -> list[str]:
+    """将长文本按指定大小分块，块间保留重叠区域以防止边界实体被切断。
+
+    关键点：在句子边界（句号/问号/感叹号/换行）处切割，避免在词语中间断开。
+    """
+    if len(text) <= chunk_size:
+        return [text]
+
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        if end < len(text):
+            # 在句子边界处切割
+            boundary = max(text.rfind("。", start, end), text.rfind("\n", start, end),
+                           text.rfind("？", start, end), text.rfind("！", start, end))
+            if boundary > start + chunk_size // 2:
+                end = boundary + 1
+        chunks.append(text[start:end])
+        start = end - overlap if end < len(text) else len(text)
+    return chunks
+
+
+# ───────────────────────────── 核心图谱查询 ─────────────────────────────
+
+async def get_graph(session: AsyncSession, novel_id: int, owner_id: int) -> dict:
+    """图谱查询（M5.1）：组装 ECharts 所需的节点/边/类别。
+
+    实现逻辑：批量取实体与关系，按度数计算节点权重，实体类型映射中文类别。
+    """
+    entities = await graph_repo.list_entities(session, novel_id)
+    relations = await graph_repo.list_relations(session, novel_id)
+    degree: dict[int, int] = {}
+    for r in relations:
+        degree[r.source_id] = degree.get(r.source_id, 0) + 1
+        degree[r.target_id] = degree.get(r.target_id, 0) + 1
+    categories: list[dict] = []
+    cat_set: set[str] = set()
+    nodes = []
+    name_by_id: dict[int, str] = {}
+    for e in entities:
+        cat = _TYPE_CN.get(e.type, e.type)
+        if cat not in cat_set:
+            cat_set.add(cat)
+            categories.append({
+                "name": cat,
+                "code": e.type,
+                "color": _TYPE_COLORS.get(e.type, "#888888"),
+            })
+        name_by_id[e.id] = e.name
+        nodes.append({
+            "id": e.id, "name": e.name, "category": cat,
+            "value": degree.get(e.id, 0), "type": e.type,
+            "profile": e.profile, "description": e.description,
+        })
+    links = [{
+        "id": r.id, "source": r.source_id, "target": r.target_id, "label": r.type,
+        "evidence": r.evidence, "sourceName": name_by_id.get(r.source_id, ""),
+        "targetName": name_by_id.get(r.target_id, ""),
+    } for r in relations]
+    return {"nodes": nodes, "links": links, "categories": categories}
+
+
+async def check_graph_exists(session: AsyncSession, novel_id: int) -> dict:
+    """检测小说是否已有图谱数据（V13 新增，供前端抽取前确认）。"""
+    ent_count, rel_count = await graph_repo.count_entities_by_novel(session, novel_id)
+    return {
+        "has_entities": ent_count > 0,
+        "entity_count": ent_count,
+        "relation_count": rel_count,
+    }
+
+
+async def list_relation_types(session: AsyncSession, owner_id: int) -> list:
+    """关系类型字典（M5.3）：系统内置 + 本人自定义。"""
+    return await graph_repo.list_relation_types(session, owner_id)
+
+
+async def list_entity_types(session: AsyncSession) -> list:
+    """实体类型字典（V13 新增）：返回7种内置类型及其颜色/符号。"""
+    return await graph_repo.list_entity_types(session)
+
+
+# ───────────────────────────── 核心抽取：先删后建 + 分块抽取（V13 重写） ─────────────────────────────
+
+async def clear_graph(session: AsyncSession, novel_id: int) -> int:
+    """清空小说图谱数据：物理删除所有实体（级联关系）。
+
+    关键点：先删关系再删实体，避免外键约束报错。
+    """
+    return await graph_repo.delete_entities_by_novel(session, novel_id)
+
+
+async def extract(session: AsyncSession, novel_id: int, owner_id: int, task_id: int | None = None) -> dict:
+    """实体关系抽取（V13 重写）：先删后建 + 分块抽取 + 7种实体类型。
+
+    整体思路：
+        1. 先清空该小说全部现有实体和关系
+        2. 获取全部章节文本
+        3. 大文本按8000字符分块，块间重叠500字符
+        4. 逐块调用 LLM 抽取，合并所有结果
+        5. 全局去重后批量落库
+
+    关键点：
+        1. 先删后建确保不残留旧数据
+        2. 分块策略避免长文本超出 LLM 上下文窗口
+        3. 跨块实体按 (name, type) 全局去重
+        4. 事件实体的 profile 中记录参与者与时间信息
+    """
+    # ---------- Step 1: 清空现有数据 ----------
+    deleted = await graph_repo.delete_entities_by_novel(session, novel_id)
+    print(f"[graph] 已清空 novel={novel_id} 的 {deleted} 个旧实体及其关系")
+
+    # ---------- Step 2: 获取章节文本 ----------
+    chapters = await novel_repo.list_all_chapters(session, novel_id)
+    if not chapters:
+        raise BizError(400, "该小说暂无章节，无法抽取")
+    text = "\n".join(c.content for c in chapters)
+    total_chars = len(text)
+    print(f"[graph] 小说 novel={novel_id} 全文 {total_chars} 字符")
+
+    # ---------- Step 3: 分块 ----------
+    chunks = _split_text(text)
+    chunk_count = len(chunks)
+    print(f"[graph] 分为 {chunk_count} 块，每块约 {_CHUNK_SIZE} 字符")
+
+    # ---------- Step 4: 获取 LLM 适配器 ----------
+    adapter, model_name = await _get_chat_adapter(session, owner_id)
+    print(f"[graph] 使用模型: {model_name}")
+
+    # ---------- Step 5: 逐块抽取 ----------
+    all_entities: list[dict] = []
+    all_relations: list[dict] = []
+    entity_set: set[tuple[str, str]] = set()  # (name, type) 全局去重
+
+    for idx, chunk in enumerate(chunks, 1):
+        if task_id and task_cancel.is_cancelled(task_id):
+            raise task_cancel.TaskCancelled("用户主动取消任务")
+
+        # 更新进度（20%~90% 按块均匀分配）
+        if task_id:
+            progress = 20 + int((idx - 1) / chunk_count * 70)
+            await task_service.update_task_progress(
+                task_id, stage=f"extracting_{idx}/{chunk_count}",
+                progress=progress, status="running",
+            )
+
+        # 调用 LLM
+        messages = [
+            {"role": "system", "content": _EXTRACT_SYSTEM},
+            {"role": "user", "content": _EXTRACT_USER.replace("{text}", chunk)},
+        ]
+        raw = await adapter.chat(messages)
+        data = _parse_json(raw)
+
+        chunk_ent, chunk_rel = 0, 0
+        # 解析实体
+        for ed in data.get("entities", []):
+            name = (ed.get("name") or "").strip()
+            if not name:
+                continue
+            etype = _normalize_type(ed.get("type", "character"))
+            key = (name, etype)
+            if key not in entity_set:
+                entity_set.add(key)
+                all_entities.append({
+                    "name": name, "type": etype,
+                    "profile": ed.get("profile") or {},
+                    "description": ed.get("description"),
+                })
+                chunk_ent += 1
+
+        # 解析关系（暂存，后续按实体映射）
+        for rd in data.get("relations", []):
+            sname = (rd.get("source") or "").strip()
+            tname = (rd.get("target") or "").strip()
+            rtype = (rd.get("type") or "").strip()
+            if sname and tname and rtype:
+                all_relations.append({
+                    "source": sname, "target": tname, "type": rtype,
+                    "evidence": rd.get("evidence"),
+                })
+                chunk_rel += 1
+
+        print(f"[graph] 第{idx}/{chunk_count}块: 实体{chunk_ent}个, 关系{chunk_rel}个 (累计实体{len(all_entities)}, 关系{len(all_relations)})")
+
+    # ---------- Step 6: 批量落库实体 ----------
+    for ed in all_entities:
+        await graph_repo.create_entity(session, Entity(
+            novel_id=novel_id, owner_id=owner_id,
+            name=ed["name"], type=ed["type"],
+            profile=ed["profile"], description=ed["description"],
+        ))
+    await session.flush()
+
+    # 构建 (name, type) → id 映射
+    ents = await graph_repo.list_entities(session, novel_id)
+    emap: dict[tuple[str, str], int] = {(e.name, e.type): e.id for e in ents}
+
+    # ---------- Step 7: 批量落库关系 ----------
+    rel_set: set[tuple[int, int, str]] = set()  # (sid, tid, type) 去重
+    rel_count = 0
+    for rd in all_relations:
+        # 尝试所有可能实体类型匹配 source
+        sid = None
+        for etype in _VALID_ENTITY_TYPES:
+            sid = emap.get((rd["source"], etype))
+            if sid:
+                break
+        # 尝试所有可能实体类型匹配 target
+        tid = None
+        for etype in _VALID_ENTITY_TYPES:
+            tid = emap.get((rd["target"], etype))
+            if tid:
+                break
+        if not (sid and tid):
+            continue
+        key = (sid, tid, rd["type"])
+        if key in rel_set:
+            continue
+        rel_set.add(key)
+        await graph_repo.create_relation(session, Relation(
+            novel_id=novel_id, owner_id=owner_id,
+            source_id=sid, target_id=tid,
+            type=rd["type"], evidence=rd.get("evidence"),
+        ))
+        rel_count += 1
+
+    await session.commit()
+    result = {"entity_count": len(all_entities), "relation_count": rel_count, "chunks": chunk_count}
+    print(f"[graph] 抽取完成 novel={novel_id}: {result}")
+    return result
+
+
+# ───────────────────────────── 后台抽取入口 ─────────────────────────────
+
+async def run_extract(novel_id: int, owner_id: int, task_id: int | None = None) -> None:
+    """后台抽取入口：自开会话调用 extract，进度回写统一任务，异常仅记录不抛出。
+
+    整体思路：
+        1. 自建独立 SessionLocal 避免阻塞HTTP请求
+        2. 分阶段更新任务进度：pending → clearing → extracting_N/M → done
+        3. 支持任务取消检查
+    """
+    from db import SessionLocal
+    async with SessionLocal() as session:
+        try:
+            if task_id:
+                if task_cancel.is_cancelled(task_id):
+                    await task_service.update_task_progress(
+                        task_id, stage="cancelled", status="cancelled",
+                        error="用户主动取消任务", finished_at=datetime.now(timezone.utc))
+                    return
+                await task_service.update_task_progress(
+                    task_id, stage="clearing", progress=5, status="running",
+                    started_at=datetime.now(timezone.utc))
+
+            result = await extract(session, novel_id, owner_id, task_id)
+
+            if task_id:
+                if task_cancel.is_cancelled(task_id):
+                    await task_service.update_task_progress(
+                        task_id, stage="cancelled", status="cancelled",
+                        error="用户主动取消任务", finished_at=datetime.now(timezone.utc))
+                    return
+                await task_service.update_task_progress(
+                    task_id, stage="done", progress=100, status="success",
+                    finished_at=datetime.now(timezone.utc),
+                    entity_count=result.get("entity_count", 0),
+                    relation_count=result.get("relation_count", 0),
+                )
+            print(f"[graph] 抽取完成 novel={novel_id} {result}")
+        except Exception as e:
+            if task_id:
+                if isinstance(e, task_cancel.TaskCancelled):
+                    await task_service.update_task_progress(
+                        task_id, stage="cancelled", status="cancelled",
+                        error=e.reason, finished_at=datetime.now(timezone.utc))
+                else:
+                    await task_service.update_task_progress(
+                        task_id, stage="failed", status="failed",
+                        error=str(e), finished_at=datetime.now(timezone.utc))
+            print(f"[graph] 抽取失败 novel={novel_id}: {e}")
+
+
+# ───────────────────────────── 实体/关系 CRUD（M5 增强） ─────────────────────────────
+
+_ENTITY_TYPES = tuple(_VALID_ENTITY_TYPES)
+
+
+async def create_entity(session: AsyncSession, novel_id: int, owner_id: int, payload: dict) -> dict:
+    """新增实体：校验名称/类型/唯一性，落库并返回概要。"""
+    name = (payload.get("name") or "").strip()
+    if not name:
+        raise BizError(400, "实体名称不能为空")
+    etype = _normalize_type(payload.get("type", "character"))
+    if await graph_repo.get_entity(session, novel_id, name, etype):
+        raise BizError(409, "该实体已存在")
+    e = await graph_repo.create_entity(session, Entity(
+        novel_id=novel_id, owner_id=owner_id, name=name, type=etype,
+        profile=payload.get("profile") or {}, description=payload.get("description"),
+    ))
+    await session.commit()
+    return {"id": e.id, "name": e.name, "type": e.type}
+
+
+async def update_entity(session: AsyncSession, owner_id: int, entity_id: int, payload: dict) -> dict:
+    """修改实体：按需更新名称/类型/画像/描述，校验唯一冲突。"""
+    e = await graph_repo.get_entity_by_id(session, entity_id)
+    if not e or e.owner_id != owner_id:
+        raise BizError(404, "实体不存在")
+    name = (payload.get("name") or "").strip()
+    etype = _normalize_type(payload.get("type", e.type))
+    if name and (name != e.name or etype != e.type):
+        if await graph_repo.get_entity(session, e.novel_id, name, etype):
+            raise BizError(409, "该实体已存在")
+        e.name = name
+    e.type = etype
+    if "profile" in payload:
+        e.profile = payload.get("profile") or {}
+    if "description" in payload:
+        e.description = payload.get("description")
+    await session.commit()
+    return {"id": e.id, "name": e.name, "type": e.type}
+
+
+async def delete_entity(session: AsyncSession, owner_id: int, entity_id: int) -> dict:
+    """物理删除实体，并级联删除其关联的关系，避免外键悬空。"""
+    e = await graph_repo.get_entity_by_id(session, entity_id)
+    if not e or e.owner_id != owner_id:
+        raise BizError(404, "实体不存在")
+    rels = await graph_repo.list_relations(session, e.novel_id)
+    for r in rels:
+        if r.source_id == entity_id or r.target_id == entity_id:
+            await graph_repo.delete_relation(session, r)
+    await graph_repo.delete_entity(session, e)
+    await session.commit()
+    return {"deleted": entity_id}
+
+
+async def create_relation(session: AsyncSession, novel_id: int, owner_id: int, payload: dict) -> dict:
+    """新增关系：校验端点存在、类型非空、非自环、唯一性。"""
+    sid = payload.get("source_id")
+    tid = payload.get("target_id")
+    rtype = (payload.get("type") or "").strip()
+    if not (sid and tid and rtype):
+        raise BizError(400, "关系需包含 source_id/target_id/type")
+    if sid == tid:
+        raise BizError(400, "关系起点与终点不能相同")
+    src = await graph_repo.get_entity_by_id(session, sid)
+    tgt = await graph_repo.get_entity_by_id(session, tid)
+    if not src or src.novel_id != novel_id or not tgt or tgt.novel_id != novel_id:
+        raise BizError(400, "起点或终点实体不存在")
+    if await graph_repo.get_relation(session, sid, tid, rtype):
+        raise BizError(409, "该关系已存在")
+    r = await graph_repo.create_relation(session, Relation(
+        novel_id=novel_id, owner_id=owner_id, source_id=sid, target_id=tid,
+        type=rtype, evidence=payload.get("evidence"),
+    ))
+    await session.commit()
+    return {"id": r.id, "source_id": r.source_id, "target_id": r.target_id, "type": r.type}
+
+
+async def update_relation(session: AsyncSession, owner_id: int, relation_id: int, payload: dict) -> dict:
+    """修改关系：可改类型/出处证据/端点，校验端点合法性。"""
+    r = await graph_repo.get_relation_by_id(session, relation_id)
+    if not r or r.owner_id != owner_id:
+        raise BizError(404, "关系不存在")
+    if payload.get("type"):
+        r.type = (payload.get("type") or "").strip()
+    if "evidence" in payload:
+        r.evidence = payload.get("evidence")
+    if "source_id" in payload or "target_id" in payload:
+        sid = payload.get("source_id", r.source_id)
+        tid = payload.get("target_id", r.target_id)
+        if sid == tid:
+            raise BizError(400, "关系起点与终点不能相同")
+        src = await graph_repo.get_entity_by_id(session, sid)
+        tgt = await graph_repo.get_entity_by_id(session, tid)
+        if not src or not tgt or src.novel_id != r.novel_id or tgt.novel_id != r.novel_id:
+            raise BizError(400, "起点或终点实体不存在")
+        r.source_id, r.target_id = sid, tid
+    await session.commit()
+    return {"id": r.id, "source_id": r.source_id, "target_id": r.target_id, "type": r.type}
+
+
+async def delete_relation(session: AsyncSession, owner_id: int, relation_id: int) -> dict:
+    """物理删除关系。"""
+    r = await graph_repo.get_relation_by_id(session, relation_id)
+    if not r or r.owner_id != owner_id:
+        raise BizError(404, "关系不存在")
+    await graph_repo.delete_relation(session, r)
+    await session.commit()
+    return {"deleted": relation_id}
