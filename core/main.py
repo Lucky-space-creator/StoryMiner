@@ -34,10 +34,10 @@ from routers import prompt_templates as prompt_templates_router
 from routers import chunks as chunks_router
 from routers import graph as graph_router
 from routers import characters as characters_router
-from routers import conversations as conversations_router
-from routers import ws_chat as ws_chat_router
 from routers import writing as writing_router
 from routers import ws_write as ws_write_router
+from routers import ws_reading_chat as ws_reading_chat_router
+from routers import reading_chat as reading_chat_router
 from routers import skills as skills_router
 from routers import extension as extension_router
 from routers import dashboard as dashboard_router
@@ -89,6 +89,24 @@ async def lifespan(app: FastAPI):
             ))
             await conn.execute(text(
                 "ALTER TABLE story_async_task ADD COLUMN IF NOT EXISTS tokens_out INTEGER NOT NULL DEFAULT 0"
+            ))
+        except Exception:
+            pass
+        # V16：阅读辅助对话扩展字段（story_conversation / story_conversation_message）。
+        # create_all 不会给已存在的表加列，显式 ALTER 补齐（幂等）。
+        try:
+            from sqlalchemy import text
+            await conn.execute(text(
+                "ALTER TABLE story_conversation "
+                "ADD COLUMN IF NOT EXISTS context_window integer NOT NULL DEFAULT 4000, "
+                "ADD COLUMN IF NOT EXISTS keep_recent integer NOT NULL DEFAULT 10, "
+                "ADD COLUMN IF NOT EXISTS compressed_summary text"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE story_conversation_message "
+                "ADD COLUMN IF NOT EXISTS attachments jsonb NOT NULL DEFAULT '[]'::jsonb, "
+                "ADD COLUMN IF NOT EXISTS is_compressed boolean NOT NULL DEFAULT false, "
+                "ADD COLUMN IF NOT EXISTS tokens integer NOT NULL DEFAULT 0"
             ))
         except Exception:
             pass
@@ -162,10 +180,10 @@ app.include_router(graph_router.rt_router, prefix="/api/v1")
 app.include_router(graph_router.et_router, prefix="/api/v1")
 app.include_router(characters_router.novel_router, prefix="/api/v1")
 app.include_router(characters_router.char_router, prefix="/api/v1")
-app.include_router(conversations_router.router, prefix="/api/v1")
-app.include_router(ws_chat_router.ws_router)
 app.include_router(writing_router.router, prefix="/api/v1")
 app.include_router(ws_write_router.ws_router)
+app.include_router(ws_reading_chat_router.ws_router)
+app.include_router(reading_chat_router.router)
 app.include_router(skills_router.router, prefix="/api/v1")
 app.include_router(extension_router.router, prefix="/api/v1")
 app.include_router(dashboard_router.router, prefix="/api/v1")

@@ -4,7 +4,8 @@
   整体思路：左侧章节列表、右侧正文区域，支持上一章/下一章快速切换。
   关键点：通过路由 chapter_id 定位当前章节；列表按 chapter_no 排序。
   -->
-  <div class="flex h-[calc(100vh-8rem)] gap-4" v-if="novel">
+  <div class="relative" v-if="novel">
+    <div class="flex h-[calc(100vh-8rem)] gap-4">
     <!-- 左侧章节列表 -->
     <aside class="w-56 shrink-0 overflow-y-auto border border-stone-200 rounded-[var(--radius-sm)] bg-surface">
       <div class="p-3 border-b border-stone-200">
@@ -86,6 +87,14 @@
         </Button>
       </div>
     </main>
+    </div>
+
+    <!-- 阅读助手入口 -->
+    <button
+      class="fixed bottom-6 right-6 z-30 flex items-center gap-1 px-4 py-2 rounded-full bg-teal-600 text-white text-sm shadow-lg hover:bg-teal-700"
+      @click="chatVisible = true"
+    >📖 阅读助手</button>
+    <ReadingChat :novel-id="novel.id" :visible="chatVisible" @close="chatVisible = false" />
   </div>
 </template>
 
@@ -96,12 +105,14 @@
 import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import Button from '@/components/ui/Button.vue'
+import ReadingChat from '@/views/novels/ReadingChat.vue'
 import { getNovel, listChapters, getChapter } from '@/api/novels'
 import { useToast } from '@/composables/useToast'
 
 const route = useRoute()
 const router = useRouter()
 const { notify } = useToast()
+const chatVisible = ref(false)
 
 const novel = ref(null)
 const chapters = ref([])

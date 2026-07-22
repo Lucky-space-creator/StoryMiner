@@ -70,7 +70,7 @@ import { useTaskPoller } from '@/composables/useTaskPoller'
 import {
   PhBookOpen, PhSignOut, PhSun, PhMoon,
   PhGauge, PhBooks, PhDatabase, PhParagraph,
-  PhGraph, PhUsers, PhChatsCircle, PhPenNib,
+  PhGraph, PhUsers, PhPenNib,
   PhCpu, PhPuzzlePiece, PhPlugs, PhFileText, PhCompass
 } from '@phosphor-icons/vue'
 import ProgressWindow from '@/components/ui/ProgressWindow.vue'
@@ -113,7 +113,6 @@ const nav = computed(() => [
     items: [
       { to: firstNovelId.value ? `/novels/${firstNovelId.value}/graph` : '/novels', label: '知识图谱', icon: PhGraph },
       { to: firstNovelId.value ? `/novels/${firstNovelId.value}/characters` : '/novels', label: '人物档案', icon: PhUsers },
-      { to: '/conversations', label: '角色对话', icon: PhChatsCircle },
       { to: '/writing', label: '续写与概览', icon: PhPenNib }
     ]
   },

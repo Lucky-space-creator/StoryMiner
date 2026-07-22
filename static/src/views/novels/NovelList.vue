@@ -103,7 +103,7 @@
       </form>
     </Modal>
 
-    <ConfirmDialog v-model="delOpen" title="删除小说" :message="`确定删除《${pending?.name}》？该小说的知识库、文档、切片、人物、图谱与对话将全部清除，且不可恢复。`" @confirm="doDelete" />
+    <ConfirmDialog v-model="delOpen" title="删除小说" :message="`确定删除《${pending?.name}》？该小说的知识库、文档、切片、人物、图谱将全部清除，且不可恢复。`" @confirm="doDelete" />
   </div>
 </template>
 

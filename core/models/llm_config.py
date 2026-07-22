@@ -40,6 +40,11 @@ class LLMConfig(Base):
     weight: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     timeout: Mapped[int] = mapped_column(Integer, default=60, nullable=False)
     status: Mapped[str] = mapped_column(String(16), default="active", nullable=False)
+    # M5 模型选型评测字段：探针实测延迟/成功率与 lite 分支开关
+    enable_lite: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    avg_latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    success_rate: Mapped[float | None] = mapped_column(Numeric(5, 4), nullable=True)
+    last_probe_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     extra: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

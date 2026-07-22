@@ -28,6 +28,8 @@ from repositories import novel_repo, llm_repo
 from services import llm_adapters, task_service
 from common import crypto
 from common import task_cancel
+from common import nlp
+from config import USE_LANGCHAIN
 from common.exceptions import BizError
 
 logger = logging.getLogger(__name__)
@@ -163,13 +165,16 @@ def _sanitize_title(title: str | None, chapter_no: int) -> str:
 
 
 async def _get_chat_adapter(session: AsyncSession, owner_id: int):
-    """取默认对话模型适配器，返回 (adapter, model_name, config_id)。"""
+    """取默认对话模型适配器，返回 (adapter, cfg, model_name, config_id)。
+
+    cfg 透传给 M4 合批函数的双轨 LLM 调用（LangChain 工厂需整条 LLMConfig）。
+    """
     cfgs = await llm_repo.list_for_dispatch(session, owner_id, "chat")
     if not cfgs:
         raise BizError(400, "尚未配置对话模型（llm_type=chat），请先在模型管理中添加")
     cfg = cfgs[0]
     adapter = llm_adapters.get_adapter(cfg, crypto.decrypt(cfg.api_key))
-    return adapter, cfg.model, cfg.id
+    return adapter, cfg, cfg.model, cfg.id
 
 
 def _parse_json(raw) -> dict | list:
@@ -361,6 +366,137 @@ async def _analyze_single_chapter(
 
 
 # ============================================================================
+# M4 混合管道：Phase2 合批分析（相邻 3 章合并一次 LLM 调用 + 注入确定性指标）
+# ============================================================================
+# 相邻章节合并一次调用，调用数约为章数/3（呼应历史优化 ~1001→~334）
+_BATCH_SIZE = 3
+
+_CHAPTER_BATCH_USER = """请分析以下小说的连续 {batch_size} 个章节，一次性返回 JSON 数组。
+
+【小说全局】
+名称：《{novel_name}》
+简介：{novel_summary}
+全书总章节数：{total}
+
+{chapters_block}
+
+【输出要求】
+只输出一个 JSON 数组（长度严格为 {batch_size}），每个元素对应上面一章，结构如下：
+{{
+  "chapter_index": <整数，必须与该章序号一致>,
+  "chapter_title": "<标题>",
+  "type": "content",
+  "summary": "80字以内情节摘要，禁止模板套话",
+  "key_events": ["2-4个关键情节事件"],
+  "characters_appeared": ["最多5个出场人物"],
+  "locations": ["最多3个地点"],
+  "plot_role": "开篇铺垫/日常过渡/冲突爆发/高潮/转折/收尾/伏笔埋设",
+  "emotional_tone": "轻松/紧张/悲情/热血/温馨/悬疑/恐怖/平淡",
+  "climax_sentence": "最精彩一句（可选）",
+  "connections": "前后章承接关系"
+}}
+仅输出 JSON 数组本身，不要 markdown 标记，不要任何解释文字。"""
+
+
+def _build_chapters_block(batch, novel_name: str, summary: str, total: int, chapters_full: list) -> str:
+    """构造合批 prompt 的章节块：每章带导航 + 确定性文本指标 + 正文。
+
+    关键点：指标由 nlp.text_metrics 零成本算出（句长方差/对话密度/TTR），
+    作为 Context 提示 LLM 把握节奏与对话占比，不再让 LLM 现算现丢。
+    """
+    blocks = []
+    for k, ch in enumerate(batch):
+        ch_title = _sanitize_title(ch.title, ch.chapter_no)
+        pos = next((i for i, c in enumerate(chapters_full) if c.id == ch.id), 0)
+        prev_title = _sanitize_title(chapters_full[pos - 1].title, chapters_full[pos - 1].chapter_no) if pos > 0 else "（无，这是第一章）"
+        next_title = _sanitize_title(chapters_full[pos + 1].title, chapters_full[pos + 1].chapter_no) if pos < len(chapters_full) - 1 else "（无，这是最后一章）"
+        content = _truncate(ch.content or "", _CHAPTER_MAX_CHARS)
+        m = nlp.text_metrics(ch.content or "")
+        metrics = (f"确定性文本指标（供参考，非指令）：句长方差={m['sentence_len_var']}，"
+                   f"对话密度={m['dialogue_density']}，词汇丰富度TTR={m['ttr']}")
+        blocks.append(
+            f"=== 第 {k + 1} / {len(batch)} 章（序号 chapter_no={ch.chapter_no}）===\n"
+            f"标题：{ch_title}\n上一章：{prev_title}\n下一章：{next_title}\n{metrics}\n正文：\n{content}"
+        )
+    return "\n\n".join(blocks)
+
+
+async def _acall_llm(messages, *, owner_id: int, task_type: str, config_id: int, cfg, use_langchain: bool):
+    """双轨 LLM 调用（M4）：LangChain 工厂 或 旧 adapter。
+
+    返回 (文本, usage)；LangChain 路径下 usage 已由 invoke_with_usage 写入 story_llm_usage，
+    故返回 None；旧 adapter 路径返回 adapter.get_last_usage() 供累计。
+    """
+    if use_langchain:
+        from llm.langchain_factory import get_langchain_model, invoke_with_usage
+        model = get_langchain_model(cfg)
+        resp = await invoke_with_usage(
+            model, messages, owner_id=owner_id, task_type=task_type, config_id=config_id)
+        content = getattr(resp, "content", None)
+        return (content if isinstance(content, str) else str(resp), None)
+    adapter = llm_adapters.get_adapter(cfg, crypto.decrypt(cfg.api_key))
+    text = await adapter.chat(messages)
+    return (text, adapter.get_last_usage())
+
+
+async def _analyze_chapter_batch(batch, novel_name, summary, total, chapters_full,
+                                 owner_id, cfg, model_name, config_id, task_id,
+                                 batch_idx, total_batches):
+    """合批分析相邻 3 章：合并一次 LLM 调用，返回 (results, usage)。
+
+    results 为 list[(chapter_db_id, chapter_no, result_dict)]；解析失败时该批逐章回退单调用（保底）。
+    usage 为该批 LLM 累计用量；LangChain 路径为 None（已写 story_llm_usage）。
+    调用次数 = 批数（远少于逐章），落实「调用降 ≥60%」。
+    """
+    tok_in = tok_out = 0
+    user_prompt = _CHAPTER_BATCH_USER \
+        .replace("{batch_size}", str(len(batch))) \
+        .replace("{novel_name}", novel_name) \
+        .replace("{novel_summary}", summary or "无") \
+        .replace("{total}", str(total)) \
+        .replace("{chapters_block}", _build_chapters_block(batch, novel_name, summary, total, chapters_full))
+    messages = [{"role": "system", "content": _CHAPTER_SYSTEM}, {"role": "user", "content": user_prompt}]
+
+    # 进度内插：按批次在 15→95 区间内推进
+    lo = 15 + int((batch_idx / max(total_batches, 1)) * 80)
+    hi = 15 + int(((batch_idx + 1) / max(total_batches, 1)) * 80)
+    if task_id:
+        await task_service.update_task_progress(task_id, stage="analyzing", progress=lo, status="running")
+
+    text, usage = await _acall_llm(
+        messages, owner_id=owner_id, task_type="chapter_analysis",
+        config_id=config_id, cfg=cfg, use_langchain=USE_LANGCHAIN)
+    if usage:
+        tok_in += usage.get("tokens_in", 0)
+        tok_out += usage.get("tokens_out", 0)
+
+    arr = _parse_json(text)
+    if not isinstance(arr, list) or not arr:
+        logger.warning("章节合批解析失败 batch=%d，逐章回退单调用", batch_idx)
+        results = []
+        for ch in batch:
+            try:
+                ch_id, data = await _analyze_single_chapter(
+                    ch, novel_name, summary or "", total, chapters_full,
+                    llm_adapters.get_adapter(cfg, crypto.decrypt(cfg.api_key)), task_id,
+                    asyncio.Semaphore(1), progress_start=lo, progress_end=hi)
+                if data is not None:
+                    results.append((ch_id, ch.chapter_no, data))
+            except Exception as e:
+                logger.warning("合批回退单章失败 chapter_no=%d: %s", ch.chapter_no, e)
+        return results, (None if usage is None else {"tokens_in": tok_in, "tokens_out": tok_out})
+
+    # 成功：优先按 chapter_index 精确匹配，缺失则按批次内顺序兜底
+    by_no = {int(r.get("chapter_index")): r for r in arr if isinstance(r, dict) and r.get("chapter_index") is not None}
+    results = []
+    for idx, ch in enumerate(batch):
+        data = by_no.get(ch.chapter_no) or (arr[idx] if idx < len(arr) else None)
+        if isinstance(data, dict):
+            results.append((ch.id, ch.chapter_no, data))
+    return results, (None if usage is None else {"tokens_in": tok_in, "tokens_out": tok_out})
+
+
+# ============================================================================
 # 主入口：两阶段章节解析
 # ============================================================================
 async def analyze_chapters(
@@ -390,7 +526,7 @@ async def analyze_chapters(
             if not chapters:
                 raise BizError(400, "该小说暂无章节，请先上传并解析文档")
 
-            adapter, model_name, config_id = await _get_chat_adapter(session, owner_id)
+            adapter, cfg, model_name, config_id = await _get_chat_adapter(session, owner_id)
 
             # ---- Phase 1: 结构分析 ----
             if async_task_id:
@@ -419,7 +555,7 @@ async def analyze_chapters(
             first_real_ch.extra = first_extra
             await session.commit()
 
-            # ---- Phase 2: 逐章分析（串行，逐一执行，不并发） ----
+            # ---- Phase 2: 合批分析（M4 混合管道：相邻3章合并一次LLM调用 + 注入确定性指标） ----
             if async_task_id:
                 await task_service.update_task_progress(task_id=async_task_id, stage="analyzing", progress=15, status="running")
 
@@ -427,45 +563,39 @@ async def analyze_chapters(
             skip_nos = set(structure.get("toc_chapters", []) or [])
             analyzable = [c for c in chapters if c.chapter_no not in skip_nos]
 
-            # 串行执行：单章顺序调用 LLM，避免并发限流与进度混乱。
-            # 复用 _analyze_single_chapter 的信号量参数，传 Semaphore(1) 即为串行占位。
-            _seq_sem = asyncio.Semaphore(1)
+            # 相邻 _BATCH_SIZE 章一组合并一次 LLM 调用（调用数 ≈ 章数/3，落实「调用降 ≥60%」）
             results: dict[int, dict] = {}  # chapter_db_id -> analysis
             analyzed = 0
             failed = 0
             cancelled = False
+            total_batches = (len(analyzable) + _BATCH_SIZE - 1) // _BATCH_SIZE if analyzable else 0
 
-            for ch in analyzable:
-                # 循环边界感知取消：用户取消后立即停止后续章节
+            for b in range(total_batches):
+                # 循环边界感知取消：用户取消后立即停止后续批次
                 if async_task_id and task_cancel.is_cancelled(async_task_id):
                     cancelled = True
                     break
+                batch = analyzable[b * _BATCH_SIZE:(b + 1) * _BATCH_SIZE]
                 try:
-                    ch_id, data = await _analyze_single_chapter(
-                        ch, novel_name, summary or "", total, chapters,
-                        adapter, async_task_id, _seq_sem,
-                        progress_start=15, progress_end=95,
-                    )
-                    if data is not None:
+                    batch_results, usage = await _analyze_chapter_batch(
+                        batch, novel_name, summary or "", total, chapters,
+                        owner_id, cfg, model_name, config_id, async_task_id,
+                        batch_idx=b, total_batches=total_batches)
+                    if usage:
+                        tok_in_total += usage.get("tokens_in", 0)
+                        tok_out_total += usage.get("tokens_out", 0)
+                    for ch_id, _no, data in batch_results:
                         results[ch_id] = data
                         analyzed += 1
-                    else:
-                        failed += 1
                 except task_cancel.TaskCancelled:
                     cancelled = True
                     break
                 except Exception as e:
-                    logger.warning("章节分析任务异常: %s", e)
-                    failed += 1
+                    logger.warning("合批分析异常 batch=%d: %s", b, e)
+                    failed += len(batch)
 
             if cancelled:
                 raise task_cancel.TaskCancelled("用户主动取消章节解析", tok_in_total, tok_out_total)
-
-            # 累计 Phase2 token
-            u2 = adapter.get_last_usage()
-            if u2:
-                tok_in_total += u2.get("tokens_in", 0) * (analyzed + failed)
-                tok_out_total += u2.get("tokens_out", 0) * (analyzed + failed)
 
             # ---- 回写分析结果 ----
             if async_task_id:

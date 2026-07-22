@@ -29,6 +29,8 @@ from repositories import graph_repo, novel_repo, llm_repo
 from services import llm_adapters, task_service
 from common import crypto
 from common import task_cancel
+from common import nlp
+from config import USE_LANGCHAIN
 from common.exceptions import BizError
 
 # ───────────────────────────── 实体类型定义（V13 扩展为7种） ─────────────────────────────
@@ -96,16 +98,148 @@ _EXTRACT_SYSTEM = """你是一个专业的小说知识图谱抽取引擎，请�
 
 _EXTRACT_USER = "请从以下小说文本中抽取所有实体和关系（共7种类型：character/place/org/time_period/event/item/concept）：\n\n{text}"
 
+# ───────────────────────────── M6 混合管道：实体/关系分离抽取 ─────────────────────────────
+# 实体仍由 LLM 分块抽取（7 类），但关系不再随实体全量抽，而是：
+# 先 nlp 共现出候选边（确定性）→ 仅对候选边调 LLM 定性（类型/方向/证据），
+# 调用次数 = 候选边数（远少于分块数），落实「调用降」。
+
+# 实体抽取提示（仅实体，不含关系输出，省 token）
+_ENTITY_SYSTEM = """你是小说知识图谱实体抽取引擎，请严格按规范从文本抽取7种实体类型。
+
+## 实体类型（共7种，必须使用指定 code）
+1. character(人物) 2. place(地点) 3. org(组织) 4. time_period(时间)
+5. event(事件) 6. item(物品) 7. concept(概念)
+
+## 规范
+- name 用原文准确名称，勿杜撰
+- profile 为 JSON 对象记录关键属性（如 {"身份":"主角","境界":"筑基期"}）
+- description 用一句简短中文概括该实体在原文中的作用
+- 仅抽取实体，不要输出关系（关系将另由共现分析定性）
+
+## 输出格式（严格 JSON，无 markdown、无解释）
+{"entities":[{"name":"张三","type":"character","profile":{"身份":"主角"},"description":"小说主人公"}]}"""
+
+_ENTITY_USER = """请从以下小说文本抽取全部实体（7种类型）。
+下列是由确定性预分析给出的候选实体（仅供参考，请核实原文后抽取，勿漏抽其他实体）：
+{candidates}
+
+文本：
+{text}"""
+
+# 关系定性提示（每条候选边一次 LLM 调用）
+_REL_QUAL_SYSTEM = """你是小说关系定性助手。给定两个频繁共现的实体 A 与 B 及原文片段，判断二者关系。
+仅输出一个 JSON 对象，不要 markdown、不要解释：
+{"type":"关系类型","direction":"A->B"|"B->A"|"none","evidence":"一句原文证据"}
+- type 用简洁中文（如 师徒/敌对/同门/父子/主仆/夫妻/上下级/挚友/仇敌）
+- direction：若关系有方向（如 A 是 B 的师父）则 A->B；反之 B->A；无向则 none"""
+
+_REL_QUAL_USER = """小说中「{a}」与「{b}」频繁共同出现。请基于以下原文片段判断二者关系：
+{ctx}"""
+
+# 共现候选边取 TopK 参与 LLM 定性（控制调用次数，残脉逆仙约260边→取前60）
+_COOCCUR_TOPK = 60
+
+
+def _format_candidates(cands: dict) -> str:
+    """把 nlp.extract_named_entities 候选格式化为注入文本。"""
+    parts = []
+    for t in ("character", "place", "org", "time"):
+        names = [c["name"] for c in cands.get(t, [])]
+        if names:
+            parts.append(f"{t}: " + "、".join(names))
+    return "\n".join(parts) if parts else "（无）"
+
+
+def _pair_context(text: str, a: str, b: str, max_chars: int = 3000) -> str:
+    """取 a 与 b 共现的窗口片段（关系定性喂料），截断到 max_chars。"""
+    import re as _re
+    idxs = [m.start() for m in _re.finditer(_re.escape(a), text)]
+    out, total = [], 0
+    for i in idxs:
+        s, e = max(0, i - 150), min(len(text), i + 300)
+        snippet = text[s:e]
+        if b in snippet:
+            out.append(snippet)
+            total += (e - s)
+            if total >= max_chars:
+                break
+    if not out:
+        if idxs:
+            i = idxs[0]
+            return text[max(0, i - 150):min(len(text), i + 300)]
+        return text[:max_chars]
+    return "\n……\n".join(out)[:max_chars]
+
+
+async def _acall_llm(messages, *, owner_id: int, task_type: str, config_id: int, cfg, use_langchain: bool):
+    """双轨 LLM 调用（M6）：LangChain 工厂 或 旧 adapter。
+
+    返回 (文本, usage)；LangChain 路径下 usage 已由 invoke_with_usage 写入 story_llm_usage，故返回 None。
+    """
+    if use_langchain:
+        from llm.langchain_factory import get_langchain_model, invoke_with_usage
+        model = get_langchain_model(cfg)
+        resp = await invoke_with_usage(
+            model, messages, owner_id=owner_id, task_type=task_type, config_id=config_id)
+        content = getattr(resp, "content", None)
+        return (content if isinstance(content, str) else str(resp), None)
+    adapter = llm_adapters.get_adapter(cfg, crypto.decrypt(cfg.api_key))
+    text = await adapter.chat(messages)
+    return (text, adapter.get_last_usage())
+
+
+async def _qualify_relations(text: str, topk: list[dict], *, cfg, config_id: int,
+                            owner_id: int, task_id: int | None = None) -> tuple[list[dict], int]:
+    """M6 关系定性核心：对共现候选边逐条 LLM 定性（类型/方向/证据）。
+
+    返回 (all_relations, rel_calls)；调用次数 = len(topk)（远少于分块数），
+    落实「调用降 ≥50%」。direction 决定 source/target 顺序，none 则保持原序。
+    """
+    all_relations: list[dict] = []
+    rel_calls = 0
+    for i, edge in enumerate(topk):
+        if task_id and task_cancel.is_cancelled(task_id):
+            raise task_cancel.TaskCancelled("用户主动取消任务")
+        if task_id:
+            await task_service.update_task_progress(
+                task_id, stage="qualifying_relations",
+                progress=88 + int(i / max(len(topk), 1) * 7), status="running")
+        ctx = _pair_context(text, edge["source"], edge["target"])
+        prompt = (_REL_QUAL_USER.replace("{a}", edge["source"])
+                  .replace("{b}", edge["target"]).replace("{ctx}", ctx))
+        messages = [{"role": "system", "content": _REL_QUAL_SYSTEM},
+                    {"role": "user", "content": prompt}]
+        raw, _usage = await _acall_llm(
+            messages, owner_id=owner_id, task_type="graph_relation",
+            config_id=config_id, cfg=cfg, use_langchain=USE_LANGCHAIN)
+        data = _parse_json(raw)
+        if not isinstance(data, dict):
+            continue
+        rtype = (data.get("type") or "").strip()
+        if not rtype:
+            continue
+        direction = data.get("direction") or "none"
+        sname, tname = (edge["target"], edge["source"]) if direction == "B->A" \
+            else (edge["source"], edge["target"])
+        all_relations.append({"source": sname, "target": tname,
+                              "type": rtype, "evidence": data.get("evidence")})
+        rel_calls += 1
+    return all_relations, rel_calls
+
 
 # ───────────────────────────── LLM 适配器 ─────────────────────────────
 
 async def _get_chat_adapter(session: AsyncSession, owner_id: int):
-    """取默认对话模型适配器（M9 分发链），返回 (adapter, model_name)。"""
+    """取默认对话模型配置（M9 分发链），返回 (cfg, model_name)。
+
+    M8 双轨收敛：USE_LANGCHAIN=true 时仅返回配置信息（LangChain 工厂内部构建模型）；
+    false 时额外创建旧 adapter 作为降级备选。cfg 透传给 M6 关系定性双轨 LLM 调用。
+    """
     cfgs = await llm_repo.list_for_dispatch(session, owner_id, "chat")
     if not cfgs:
         raise BizError(400, "尚未配置对话模型（llm_type=chat），请先在模型管理中添加")
     cfg = cfgs[0]
-    return llm_adapters.get_adapter(cfg, crypto.decrypt(cfg.api_key)), cfg.model
+    return cfg, cfg.model
 
 
 # ───────────────────────────── JSON 解析 ─────────────────────────────
@@ -272,8 +406,9 @@ async def extract(session: AsyncSession, novel_id: int, owner_id: int, task_id: 
     chunk_count = len(chunks)
     print(f"[graph] 分为 {chunk_count} 块，每块约 {_CHUNK_SIZE} 字符")
 
-    # ---------- Step 4: 获取 LLM 适配器 ----------
-    adapter, model_name = await _get_chat_adapter(session, owner_id)
+    # ---------- Step 4: 获取 LLM 配置 ----------
+    cfg, model_name = await _get_chat_adapter(session, owner_id)
+    config_id = cfg.id
     print(f"[graph] 使用模型: {model_name}")
 
     # ---------- Step 5: 逐块抽取 ----------
@@ -281,28 +416,34 @@ async def extract(session: AsyncSession, novel_id: int, owner_id: int, task_id: 
     all_relations: list[dict] = []
     entity_set: set[tuple[str, str]] = set()  # (name, type) 全局去重
 
+    # 确定性候选（零成本）：供实体抽取提示与关系定性边入围（M6）
+    cand_block = _format_candidates(nlp.extract_named_entities(text))
+    print(f"[graph] 确定性候选实体已产出（供 LLM 参考）")
+
     for idx, chunk in enumerate(chunks, 1):
         if task_id and task_cancel.is_cancelled(task_id):
             raise task_cancel.TaskCancelled("用户主动取消任务")
 
-        # 更新进度（20%~90% 按块均匀分配）
+        # 更新进度（20%~85% 按块均匀分配，留出关系定性区间）
         if task_id:
-            progress = 20 + int((idx - 1) / chunk_count * 70)
+            progress = 20 + int((idx - 1) / chunk_count * 65)
             await task_service.update_task_progress(
                 task_id, stage=f"extracting_{idx}/{chunk_count}",
                 progress=progress, status="running",
             )
 
-        # 调用 LLM
+        # 调用 LLM：仅抽实体（关系由共现候选边另做定性，降低调用数）
+        # M8 双轨收敛：实体抽取走 _acall_llm，USE_LANGCHAIN=true 时走 LangChain 路径
         messages = [
-            {"role": "system", "content": _EXTRACT_SYSTEM},
-            {"role": "user", "content": _EXTRACT_USER.replace("{text}", chunk)},
+            {"role": "system", "content": _ENTITY_SYSTEM},
+            {"role": "user", "content": _ENTITY_USER.replace("{candidates}", cand_block).replace("{text}", chunk)},
         ]
-        raw = await adapter.chat(messages)
+        raw, _usage = await _acall_llm(
+            messages, owner_id=owner_id, task_type="graph_entity",
+            config_id=config_id, cfg=cfg, use_langchain=USE_LANGCHAIN)
         data = _parse_json(raw)
 
-        chunk_ent, chunk_rel = 0, 0
-        # 解析实体
+        chunk_ent = 0
         for ed in data.get("entities", []):
             name = (ed.get("name") or "").strip()
             if not name:
@@ -318,19 +459,7 @@ async def extract(session: AsyncSession, novel_id: int, owner_id: int, task_id: 
                 })
                 chunk_ent += 1
 
-        # 解析关系（暂存，后续按实体映射）
-        for rd in data.get("relations", []):
-            sname = (rd.get("source") or "").strip()
-            tname = (rd.get("target") or "").strip()
-            rtype = (rd.get("type") or "").strip()
-            if sname and tname and rtype:
-                all_relations.append({
-                    "source": sname, "target": tname, "type": rtype,
-                    "evidence": rd.get("evidence"),
-                })
-                chunk_rel += 1
-
-        print(f"[graph] 第{idx}/{chunk_count}块: 实体{chunk_ent}个, 关系{chunk_rel}个 (累计实体{len(all_entities)}, 关系{len(all_relations)})")
+        print(f"[graph] 第{idx}/{chunk_count}块: 实体{chunk_ent}个 (累计{len(all_entities)})")
 
     # ---------- Step 6: 批量落库实体 ----------
     for ed in all_entities:
@@ -345,7 +474,16 @@ async def extract(session: AsyncSession, novel_id: int, owner_id: int, task_id: 
     ents = await graph_repo.list_entities(session, novel_id)
     emap: dict[tuple[str, str], int] = {(e.name, e.type): e.id for e in ents}
 
-    # ---------- Step 7: 批量落库关系 ----------
+    # ---------- Step 7（M6 混合管道）：关系定性（共现候选边 → LLM 仅定性） ----------
+    co_edges = nlp.build_cooccurrence(text)
+    co_edges.sort(key=lambda e: e.get("weight", 0), reverse=True)
+    topk = co_edges[:_COOCCUR_TOPK]
+    all_relations, rel_calls = await _qualify_relations(
+        text, topk, cfg=cfg, config_id=config_id, owner_id=owner_id, task_id=task_id)
+    print(f"[graph] 关系定性: 候选边 {len(topk)} 条 → 有效关系 {rel_calls} 条 "
+          f"（分块抽取 {chunk_count} 次 → 关系调用降至 {rel_calls} 次）")
+
+    # ---------- Step 8: 批量落库关系 ----------
     rel_set: set[tuple[int, int, str]] = set()  # (sid, tid, type) 去重
     rel_count = 0
     for rd in all_relations:

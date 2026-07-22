@@ -88,6 +88,18 @@ def to_user_error(exception: Exception) -> str:
     if isinstance(exception, BizError):
         return exception.msg
 
+    # 1.5) 异常类型名兜底：str(e) 可能为空（如 asyncio.TimeoutError / TimeoutError），
+    #     此时关键字匹配必失效，需按 type.__name__ 直接映射，避免落入「未知错误」掩盖真实原因。
+    _TYPE_MAP = {
+        "TimeoutError": "模型服务响应超时，请检查网络或更换模型（后台任务超时）",
+        "CancelledError": "任务已被取消",
+        "ConnectionError": "连接模型服务失败，请检查模型地址是否可访问",
+        "ConnectionRefusedError": "模型服务拒绝连接，请确认模型服务已启动",
+    }
+    etype = type(exception).__name__
+    if etype in _TYPE_MAP:
+        return _TYPE_MAP[etype]
+
     # 2) 关键字匹配（按优先级，首次命中即返回）
     msg_lower = msg.lower()
     for keyword, friendly in _ERROR_MAP:

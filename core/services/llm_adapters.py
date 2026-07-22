@@ -19,6 +19,9 @@ import time
 
 import httpx
 
+from config import ENABLE_LLM_CACHE
+from common.cache_adapter import default_cache
+
 # 走 OpenAI 兼容协议的厂商（其余非 ollama 默认也按兼容协议处理）
 _OPENAI_COMPATIBLE = {
     "openai", "claude", "anthropic", "智谱", "zhipu", "通义", "qwen",
@@ -94,6 +97,13 @@ class OpenAIAdapter(LLMAdapter):
         返回格式：str（纯文本），同时内部记录 _last_usage 供上层提取 Token 用量。
         上层可调用 get_last_usage() 获取本次调用的 token 统计。
         """
+        # M5 结果缓存：命中则直接复用，跳过 LLM 调用（需 ENABLE_LLM_CACHE 开启）
+        cache_key = f"chat:{self.model}:" + json.dumps(messages, ensure_ascii=False)
+        if ENABLE_LLM_CACHE:
+            hit = default_cache.get(cache_key)
+            if hit is not None:
+                self._last_usage = hit.get("_usage")
+                return hit.get("_text", "")
         payload = {"model": self.model, "messages": messages, "stream": False, **opts}
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             resp = await client.post(f"{self.base_url}/v1/chat/completions", headers=self._headers(), json=payload)
@@ -109,6 +119,8 @@ class OpenAIAdapter(LLMAdapter):
         # 兼容部分 OpenAI 兼容模型将 content 以内容块列表形式返回（多模态/结构化输出场景）
         if isinstance(content, list):
             content = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
+        if ENABLE_LLM_CACHE:
+            default_cache.set(cache_key, {"_text": content or "", "_usage": self._last_usage})
         return content or ""
 
     async def chat_stream(self, messages: list[dict], **opts):
@@ -196,6 +208,13 @@ class OllamaAdapter(LLMAdapter):
 
         返回格式：str（纯文本），同时内部记录 _last_usage 供上层提取 Token 用量。
         """
+        # M5 结果缓存：命中则直接复用，跳过 LLM 调用（需 ENABLE_LLM_CACHE 开启）
+        cache_key = f"chat:{self.model}:" + json.dumps(messages, ensure_ascii=False)
+        if ENABLE_LLM_CACHE:
+            hit = default_cache.get(cache_key)
+            if hit is not None:
+                self._last_usage = hit.get("_usage")
+                return hit.get("_text", "")
         payload = {"model": self.model, "messages": messages, "stream": False}
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             resp = await client.post(f"{self.base_url}/api/chat", json=payload)
@@ -210,6 +229,8 @@ class OllamaAdapter(LLMAdapter):
         # 兼容 content 为内容块列表的情况
         if isinstance(content, list):
             content = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
+        if ENABLE_LLM_CACHE:
+            default_cache.set(cache_key, {"_text": content or "", "_usage": self._last_usage})
         return content or ""
 
     async def chat_stream(self, messages: list[dict], **opts):

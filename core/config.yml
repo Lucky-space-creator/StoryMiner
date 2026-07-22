@@ -9,7 +9,7 @@ database:
 # 线程池配置
 background:
   thread_pool_size: 20
-  task_timeout: 300
+  task_timeout: 1800
   # 切片嵌入/落库并发与批大小（Chroma-only 流式分批）
   embed_batch: 32                 # 单次嵌入请求携带的文本条数
   embed_concurrency: 8            # 并发嵌入批次上限（信号量）
@@ -56,3 +56,30 @@ minio:
   secret_key: "minioadmin"
   bucket: "story-rag"
   secure: false
+
+# --- 混合分析管道配置（M1/M5/M7/M8） ---
+
+# LangChain 接入开关（M1 框架底座 → M8 默认开启）
+#   true：走 langchain_factory 路径（ChatOpenAI/ChatOllama），用量自动回写 story_llm_usage
+#   false：回退旧 llm_adapters 路径
+langchain:
+  enabled: true
+
+# LangGraph 工作流编排（M7，暂不启用）
+#   true：走 StateGraph 多步编排（preprocess→llm_extract→validate→retry→aggregate）
+#   false：保留 task_service 线性流程
+langgraph:
+  enabled: false
+
+# LLM 结果缓存（M5 P3 进程内 TTL）
+#   true：启用 cachetools.TTLCache，key=(model, novel_id, stage, hash(text))
+#   false：每次重新调 LLM
+cache:
+  enabled: false
+  ttl: 3600                 # 缓存有效期（秒）
+
+# 敏感字段加密密钥（M9 模型 api_key / 后续 MCP 凭据）
+#   44字符视为合法 Fernet key 直接使用；否则按内容 sha256 派生
+#   留空则自动从 jwt.secret 派生（开发环境可用）
+encryption:
+  key: ""

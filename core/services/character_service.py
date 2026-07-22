@@ -27,6 +27,8 @@ from services import llm_adapters, task_service
 from common import crypto
 from common import task_cancel
 from common.exceptions import BizError
+from common import nlp
+from config import USE_LANGCHAIN, LANGGRAPH_ENABLED
 
 logger = logging.getLogger(__name__)
 
@@ -360,6 +362,168 @@ async def generate_profile_async(char_id: int, owner_id: int, task_id: int | Non
 # ---------------------------------------------------------------------------
 # 批量人物分析（小说详情页「任务分析」按钮触发）
 # ---------------------------------------------------------------------------
+# M3 混合管道：先 nlp 确定性层出候选+出现次数，再 LLM 候选精析（见 _analyze_candidates）
+
+# 单候选精析提示词：给定人物名+相关片段，产出该人物结构化档案
+_CANDIDATE_PROMPT = """你是小说人物小传撰写助手。请根据提供的小说片段，为【指定人物】生成结构化档案。
+仅输出一个 JSON 对象，不要包含任何解释或 markdown 标记，格式严格如下：
+{
+  "role":"主角/配角/反派",
+  "gender":"男/女/未知",
+  "identity":"身份或职业",
+  "personality":"性格特点",
+  "appearance":"外貌特征",
+  "catchphrase":"口头禅",
+  "description":"150字以内的人物小传，包含大致经历"
+}
+人物姓名：{name}
+相关小说片段：
+{text}"""
+
+
+def _extract_context(text: str, name: str, max_chars: int = 4000) -> str:
+    """取含指定人名的相关片段拼接（候选精析喂料），截断到 max_chars。
+
+    优先截取人名出现的上下文窗口（前 200 + 后 400 字符），在前 max_chars 内覆盖尽量多出现点；
+    若人名未出现（极端情况），退回全文前 max_chars。
+    """
+    import re as _re
+    idxs = [m.start() for m in _re.finditer(_re.escape(name), text)]
+    if not idxs:
+        return text[:max_chars]
+    snippets, total = [], 0
+    for i in idxs:
+        s, e = max(0, i - 200), min(len(text), i + 400)
+        snippets.append(text[s:e])
+        total += (e - s)
+        if total >= max_chars:
+            break
+    return "\n……\n".join(snippets)[:max_chars]
+
+
+async def _call_llm(messages, *, owner_id, task_type, config_id, cfg, use_langchain):
+    """双轨 LLM 调用（M1/M3）：LangChain 工厂 或 旧 adapter。
+
+    返回 (文本, usage)；LangChain 路径下 usage 已由 invoke_with_usage 写入 story_llm_usage，
+    故此处返回 None 避免上层重复统计；旧 adapter 路径返回 adapter.get_last_usage() 供累计。
+    """
+    if use_langchain:
+        from llm.langchain_factory import get_langchain_model, invoke_with_usage
+        model = get_langchain_model(cfg)
+        resp = await invoke_with_usage(
+            model, messages, owner_id=owner_id, task_type=task_type, config_id=config_id)
+        content = getattr(resp, "content", None)
+        return (content if isinstance(content, str) else str(resp), None)
+    adapter = llm_adapters.get_adapter(cfg, crypto.decrypt(cfg.api_key))
+    text = await adapter.chat(messages)
+    return (text, adapter.get_last_usage())
+
+
+async def _analyze_candidates(session, novel_id, owner_id, full_text, cands, async_task_id):
+    """候选精析（M3 混合管道核心）：nlp 候选名单 → 每候选 LLM 精析 → 写 story_character。
+
+    出现次数取 nlp 准确 freq（零成本、不依赖 LLM）；调用次数 = 候选数，
+    远少于旧分片抽全类，落实「调用降 ≥50%」。无候选时不调用本函数（回退分片逻辑）。
+    """
+    cfgs = await llm_repo.list_for_dispatch(session, owner_id, "chat")
+    if not cfgs:
+        raise BizError(400, "尚未配置对话模型（llm_type=chat），请先在模型管理中添加")
+    cfg = cfgs[0]
+    config_id = cfg.id
+    use_lc = USE_LANGCHAIN
+    n = len(cands)
+    created = skipped = 0
+    tok_in = tok_out = 0
+    for i, c in enumerate(cands):
+        name = c["name"]
+        freq = c.get("freq", 0)
+        lo = 20 + int(i / n * 65)
+        if async_task_id:
+            await task_service.update_task_progress(
+                async_task_id, stage="analyzing", progress=lo, status="running")
+        if async_task_id and task_cancel.is_cancelled(async_task_id):
+            if tok_in or tok_out:
+                await task_service.record_llm_usage(
+                    owner_id=owner_id, config_id=config_id, model=cfg.model,
+                    task_type="character_analysis", tokens_in=tok_in, tokens_out=tok_out)
+            await task_service.update_task_progress(async_task_id, tokens_in=tok_in, tokens_out=tok_out)
+            raise task_cancel.TaskCancelled("用户主动取消人物", tok_in, tok_out)
+        context = _extract_context(full_text, name)
+        prompt = _CANDIDATE_PROMPT.replace("{name}", name).replace("{text}", context)
+        messages = [{"role": "user", "content": prompt}]
+        text, usage = await _call_llm(
+            messages, owner_id=owner_id, task_type="character_analysis",
+            config_id=config_id, cfg=cfg, use_langchain=use_lc)
+        if usage:
+            tok_in += usage.get("tokens_in", 0)
+            tok_out += usage.get("tokens_out", 0)
+        data = _parse_json(text)
+        item = data[0] if isinstance(data, list) else data
+        if not isinstance(item, dict):
+            continue
+        existing = await character_repo.get_by_novel_name(session, novel_id, name)
+        if existing:
+            skipped += 1
+            continue
+        c_obj = Character(
+            novel_id=novel_id, owner_id=owner_id, name=name,
+            role=(item.get("role") or "配角").strip() or "配角",
+            gender=(item.get("gender") or "").strip() or None,
+            identity=(item.get("identity") or "").strip() or None,
+            personality=(item.get("personality") or "").strip() or None,
+            appearance=(item.get("appearance") or "").strip() or None,
+            catchphrase=(item.get("catchphrase") or "").strip() or None,
+            description=(item.get("description") or "").strip()[:150] or None,
+            source="auto", appearances=freq,
+        )
+        session.add(c_obj)
+        created += 1
+    await session.commit()
+    if tok_in or tok_out:
+        await task_service.record_llm_usage(
+            owner_id=owner_id, config_id=config_id, model=cfg.model,
+            task_type="character_analysis", tokens_in=tok_in, tokens_out=tok_out)
+    if async_task_id:
+        await task_service.update_task_progress(
+            async_task_id, stage="done", progress=100, status="success",
+            message=f"已创建 {created} 个人物" + (f"，跳过 {skipped} 个已存在" if skipped else ""),
+            finished_at=datetime.now(timezone.utc),
+            tokens_in=tok_in, tokens_out=tok_out,
+            extra={"created": created, "skipped": skipped, "candidates": n})
+    return {"created": created, "skipped": skipped, "candidates": n}
+
+
+async def analyze_via_graph(session, novel_id, owner_id, full_text, cands, async_task_id):
+    """M7 编排层入口：用 LangGraph 状态图执行人物分析（extract→analyze→persist）。
+
+    与 M3 线性 _analyze_candidates 产出一致（候选精析 + nlp 准确 appearances），
+    区别仅在于用状态图编排节点，便于后续扩展去重/质检/回退节点。
+    """
+    from graph.character_analysis_graph import build_graph
+    cfgs = await llm_repo.list_for_dispatch(session, owner_id, "chat")
+    if not cfgs:
+        raise BizError(400, "尚未配置对话模型（llm_type=chat），请先在模型管理中添加")
+    cfg = cfgs[0]
+    config_id = cfg.id
+    graph = build_graph()
+    initial = {
+        "novel_id": novel_id, "owner_id": owner_id, "full_text": full_text,
+        "candidates": cands, "results": [], "created": 0, "skipped": 0,
+    }
+    final = await graph.ainvoke(
+        initial, config={"configurable": {"session": session, "cfg": cfg, "config_id": config_id}})
+    created = final["created"]
+    skipped = final["skipped"]
+    n = len(final["candidates"])
+    if async_task_id:
+        await task_service.update_task_progress(
+            async_task_id, stage="done", progress=100, status="success",
+            message=f"已创建 {created} 个人物" + (f"，跳过 {skipped} 个已存在" if skipped else ""),
+            finished_at=datetime.now(timezone.utc),
+            extra={"created": created, "skipped": skipped, "candidates": n})
+    return {"created": created, "skipped": skipped, "candidates": n}
+
+
 _ANALYZE_PROMPT = """你是小说人物分析助手，请根据提供的小说简介和正文片段，识别小说中的主要人物并生成结构化档案。
 
 请严格按以下 JSON 数组格式输出（只输出 JSON，不要包含任何解释或 markdown 标记）：
@@ -420,6 +584,17 @@ async def analyze_and_create_characters(
             if not chapters:
                 raise BizError(400, "该小说暂无章节正文，请先上传并解析文档")
             full_text = "\n".join(ch.content for ch in chapters)
+            # ── M3/M7 混合管道：确定性层优先（候选精析） ──
+            # 先 nlp 零成本产出人物候选与准确出现次数，再 LLM 逐候选精析小传；
+            # 调用次数=候选数（远少于旧分片抽全类），落实「调用降 ≥50%」。
+            # 启用 LangGraph 编排层（M7）时走状态图路径，否则走 M3 线性路径。
+            cands = nlp.extract_person_candidates(full_text, min_freq=2)
+            if cands and LANGGRAPH_ENABLED:
+                return await analyze_via_graph(session, novel_id, owner_id, full_text, cands, async_task_id)
+            if cands:
+                return await _analyze_candidates(
+                    session, novel_id, owner_id, full_text, cands, async_task_id)
+            # 无候选（确定性层漏召回）回退旧分片逻辑（保底）
             # 长文策略：按阅读顺序分片，每片在 prompt 中携带简介；主要人物多在前段，优先覆盖
             chunks = _chunk_text(full_text)
             n = len(chunks)

@@ -101,3 +101,26 @@ MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", _minio.get("access_key", "minio
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", _minio.get("secret_key", "minioadmin"))
 MINIO_BUCKET = os.getenv("MINIO_BUCKET", _minio.get("bucket", "story-rag"))
 MINIO_SECURE = str(os.getenv("MINIO_SECURE", _minio.get("secure", "false"))).lower() == "true"
+
+# 双轨开关：LangChain / LangGraph 接入（混合分析管道 M1）
+#   false（默认）：service 走旧 llm_adapters + task_service 线性流程
+#   true：走 langchain_factory / LangGraph 路径（后续阶段）
+# 配置源优先级：环境变量 USE_LANGCHAIN > config.yml langchain.enabled > 默认 false
+USE_LANGCHAIN = (
+    str(os.getenv("USE_LANGCHAIN", _cfg.get("langchain", {}).get("enabled", "true")))
+    .lower() == "true"
+)
+
+# 结果缓存开关（混合分析管道 M5 P3）：默认关，真实集成验证时置 true 启用进程内 TTL 缓存
+#   优先级：环境变量 ENABLE_LLM_CACHE > config.yml cache.enabled > 默认 false
+ENABLE_LLM_CACHE = (
+    str(os.getenv("ENABLE_LLM_CACHE", _cfg.get("cache", {}).get("enabled", "false")))
+    .lower() == "true"
+)
+
+# LangGraph 编排开关（混合分析管道 M7）：默认关，安装 langgraph 且验证后开启
+#   优先级：环境变量 LANGGRAPH_ENABLED > config.yml langgraph.enabled > 默认 false
+LANGGRAPH_ENABLED = (
+    str(os.getenv("LANGGRAPH_ENABLED", _cfg.get("langgraph", {}).get("enabled", "false")))
+    .lower() == "true"
+)

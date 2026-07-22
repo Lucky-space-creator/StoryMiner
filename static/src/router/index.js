@@ -9,7 +9,6 @@ import KBDetail from '@/views/kb/KBDetail.vue'
 import ChunkBrowser from '@/views/chunks/ChunkBrowser.vue'
 import GraphView from '@/views/graph/GraphView.vue'
 import CharacterView from '@/views/characters/CharacterView.vue'
-import ConversationView from '@/views/conversations/ConversationView.vue'
 import WritingView from '@/views/writing/WritingView.vue'
 import LlmConfigView from '@/views/llm/LlmConfigView.vue'
 import SkillView from '@/views/skills/SkillView.vue'
@@ -31,7 +30,6 @@ const routes = [
   { path: '/chunks', name: 'chunks', component: ChunkBrowser, meta: { title: '文档切片', requiresAuth: true } },
   { path: '/novels/:id/graph', name: 'graph', component: GraphView, meta: { title: '知识图谱', requiresAuth: true } },
   { path: '/novels/:id/characters', name: 'characters', component: CharacterView, meta: { title: '人物档案', requiresAuth: true } },
-  { path: '/conversations', name: 'conversations', component: ConversationView, meta: { title: '角色对话', requiresAuth: true } },
   { path: '/writing', name: 'writing', component: WritingView, meta: { title: '续写与概览', requiresAuth: true } },
   { path: '/llm-configs', name: 'llm', component: LlmConfigView, meta: { title: '模型管理', requiresAuth: true } },
   { path: '/skills', name: 'skills', component: SkillView, meta: { title: 'Skill 管理', requiresAuth: true } },

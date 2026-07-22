@@ -98,4 +98,18 @@ def split_text(text: str) -> list[dict]:
             "char_end": content_end,
         })
 
-    return chapters
+    # 过滤目录(TOC)条目：文档开头的目录块中，每条「第X章 标题」独占一行，
+    # 标题行与下一标题行之间没有任何正文（content 为空），它们只是索引而非正文章节。
+    # 整体思路：真实章节必有正文（content 非空），而目录条目的 content 为空。
+    # 关键点：
+    #   1. 丢弃所有 content 为空的章节（即目录/纯标题行），避免目录被当成章节。
+    #   2. 若全部为空（整篇都是目录/无正文），退回单章保留全文，避免数据丢失。
+    # 实现：列表推导过滤空正文；空则退回单章。
+    real_chapters = [c for c in chapters if c["content"]]
+    if not real_chapters:
+        stripped = text.strip()
+        return [{
+            "title": None, "content": stripped,
+            "word_count": len(stripped), "char_start": 0, "char_end": len(text),
+        }]
+    return real_chapters

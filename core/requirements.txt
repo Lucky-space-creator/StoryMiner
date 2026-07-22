@@ -14,3 +14,16 @@ jinja2==3.1.4
 chromadb==0.5.5
 onnxruntime==1.18.0
 minio==7.2.20
+
+# 混合分析管道 M1：LangChain 调用层（替代自研 llm_adapters）
+langchain>=0.3,<0.4
+langchain-openai>=0.2
+langchain-community>=0.3
+langchain-ollama>=0.3
+# 混合分析管道 M2：确定性预处理层（jieba）
+jieba==0.42.1
+# 混合分析管道 M5：结果缓存薄封装（不自研 LRU，底层 cachetools.TTLCache）
+cachetools>=5.3
+# 混合分析管道 M7：LangGraph 工作流编排层（状态图 extract→analyze→persist）
+# 固定 0.2.x 系列以兼容现有 langchain 0.3.x / langchain-core 0.3.x（1.x 会强升 core 至 1.x 破坏兼容）
+langgraph>=0.2,<0.3

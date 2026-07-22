@@ -13,6 +13,8 @@
 实现逻辑：
     基于 async session 的 select/update/delete；用量聚合按 config/model/task_type 分组求和。
 """
+import time
+
 from sqlalchemy import select, func, update, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -53,14 +55,60 @@ async def list_configs(session: AsyncSession, owner_id: int, llm_type: str | Non
     return list((await session.execute(stmt)).scalars().all())
 
 
-async def list_for_dispatch(session: AsyncSession, owner_id: int, llm_type: str) -> list[LLMConfig]:
-    """降级分发链（M9.8）：同类型 active 配置，默认优先、weight 次之。"""
+async def list_for_dispatch(session: AsyncSession, owner_id: int, llm_type: str, lite: bool = False) -> list[LLMConfig]:
+    """降级分发链（M9.8）：同类型 active 配置，默认优先、weight 次之。
+
+    lite=True（M5 延迟敏感分支）：仅取已探针且开启 enable_lite 的配置，
+    按实测 avg_latency_ms 升序（快者优先），供人物/章节分析等重延迟任务的「模型选型」。
+    """
+    if lite:
+        stmt = select(LLMConfig).where(
+            or_(LLMConfig.owner_id == owner_id, LLMConfig.owner_id.is_(None)),
+            LLMConfig.llm_type == llm_type,
+            LLMConfig.status == "active",
+            LLMConfig.enable_lite.is_(True),
+            LLMConfig.avg_latency_ms.isnot(None),
+        ).order_by(LLMConfig.avg_latency_ms.asc(), LLMConfig.id.desc())
+        return list((await session.execute(stmt)).scalars().all())
     stmt = select(LLMConfig).where(
         or_(LLMConfig.owner_id == owner_id, LLMConfig.owner_id.is_(None)),
         LLMConfig.llm_type == llm_type,
         LLMConfig.status == "active",
     ).order_by(LLMConfig.is_default.desc(), LLMConfig.weight.desc(), LLMConfig.id.desc())
     return list((await session.execute(stmt)).scalars().all())
+
+
+async def record_probe_result(session: AsyncSession, cfg_id: int, avg_latency_ms: int, success_rate: float) -> None:
+    """写回探针评测结果（M5 模型选型评测），更新延迟/成功率与时间戳。"""
+    await session.execute(
+        update(LLMConfig).where(LLMConfig.id == cfg_id).values(
+            avg_latency_ms=avg_latency_ms,
+            success_rate=success_rate,
+            last_probe_at=func.now(),
+        )
+    )
+
+
+async def probe_config(adapter, cfg_id: int, n: int = 3):
+    """对单个配置跑轻量探针，返回 (avg_latency_ms, success_rate)（M5 模型选型评测）。
+
+    需可用 LLM 端点（在线）：发 n 次一句话补全，统计平均延迟与成功率；
+    结果由调用方经 record_probe_result 写回 story_llm_config（本函数不触碰 DB）。
+    """
+    sample = [{"role": "user", "content": "用一句话介绍你自己。"}]
+    latencies: list[float] = []
+    ok = 0
+    for _ in range(n):
+        t0 = time.perf_counter()
+        try:
+            await adapter.chat(sample)
+            ok += 1
+            latencies.append((time.perf_counter() - t0) * 1000)
+        except Exception:
+            pass
+    if not latencies:
+        return None, 0.0
+    return int(sum(latencies) / len(latencies)), ok / n
 
 
 async def clear_default(session: AsyncSession, owner_id: int, llm_type: str) -> None:
