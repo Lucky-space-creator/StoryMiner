@@ -5,6 +5,33 @@
 # 数据库连接（SQLAlchemy 异步 DSN）
 database:
   dsn: "postgresql+asyncpg://postgres:root@localhost:5432/story_rag"
+  # L1 连接池治理：原 asyncpg 默认 pool_size=5，全流程并发分析易耗尽连接。
+  # pool_size=20 + max_overflow=10（上限 30）；pre_ping 规避 PG 服务端断连；
+  # pool_recycle=1800s(30min) 回收空闲连接，避免 "server closed the connection"。
+  pool_size: 20
+  max_overflow: 10
+  pool_timeout: 30
+  pool_recycle: 1800
+  pool_pre_ping: true
+
+# L2 异步任务架构：Redis broker + Celery worker（性能跃迁核心）
+# 注意：本机 Redis 为 3.2.100 老版本，需 redis-py 以 protocol=2 连接（见 redis_client.py）。
+# async_mode=false 表示默认回落串行队列（opt-in）；部署 celery worker 后改为 true。
+redis:
+  url: "redis://127.0.0.1:6363/0"
+  password: ""
+
+# 混合分析管道调度配置
+pipeline:
+  async_mode: false          # 置 true 启用 Celery 并行（需先启动 celery worker）
+  worker_concurrency: 8      # 每个 worker 进程并发执行任务数（建议 = CPU 核数）
+
+# 分析模式（极速 / 深度思考）：小说分析的两种入口
+#   mode_default: turbo=极速摘要(大上下文少调用，秒~分钟出)，deep=深度全量建库
+#   turbo_max_input_chars: 极速单次投喂模型的正文字符上限，模型上下文越大可上调
+analysis:
+  mode_default: turbo
+  turbo_max_input_chars: 120000
 
 # 线程池配置
 background:

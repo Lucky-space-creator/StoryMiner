@@ -22,7 +22,7 @@ from models.llm_config import LLMConfig
 from repositories import llm_repo
 from common import crypto
 from common.exceptions import BizError
-from services import llm_adapters
+from llm import langchain_factory as llm_adapters
 
 
 def _iso(dt) -> str | None:

@@ -20,6 +20,8 @@
 import asyncio
 import logging
 
+from config import USE_CELERY, CELERY_AVAILABLE
+
 logger = logging.getLogger(__name__)
 
 # 进程内单例队列与 worker，延迟到事件循环内初始化
@@ -35,13 +37,32 @@ def _get_queue() -> asyncio.Queue:
     return _queue
 
 
+def _func_path(func) -> str:
+    """将函数对象转为 'module.qualname' 路径字符串，供 Celery broker 序列化传递。"""
+    return f"{func.__module__}.{func.__qualname__}"
+
+
 def submit(func, *args, **kwargs) -> None:
-    """将一个 async 任务函数入队，等待串行执行（同步入队，立即返回）。
+    """将一个 async 任务函数入队执行（同步入队，立即返回）。
 
     参数：
-        func: 待执行的协程函数（async def）。
+        func: 待执行的协程函数（async def）。DB 任务 id 已作为 args 首元素注入。
         *args/**kwargs: 传给 func 的参数。
+
+    L2 双模说明：
+        当 config.USE_CELERY=True 且 celery 已安装时，任务投递到 Celery + Redis broker，
+        由多 worker 并行执行；若投递失败（如参数含不可 JSON 序列化的复杂对象），
+        安全回落到原进程内串行队列，保证任何情况下任务都能跑、接口不 500。
     """
+    if USE_CELERY and CELERY_AVAILABLE:
+        try:
+            from common.celery_tasks import dispatch_task
+
+            dispatch_task.delay(_func_path(func), list(args), kwargs)
+            logger.info("任务已投递 Celery: %s", _func_path(func))
+            return
+        except Exception as exc:  # 序列化失败/ broker 不可达 -> 回落串行
+            logger.warning("Celery 投递失败，回落串行队列: %s (%s)", _func_path(func), exc)
     _get_queue().put_nowait((func, args, kwargs))
     logger.info("任务入队，当前队列积压 %d 个", _get_queue().qsize())
 

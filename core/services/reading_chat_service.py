@@ -27,7 +27,7 @@ from common.crypto import decrypt
 from models.llm_config import LLMConfig
 from models.novel_content import Novel
 from repositories.llm_repo import list_for_dispatch, get_owned
-from services.llm_adapters import get_adapter
+from llm.langchain_factory import get_adapter
 from common.task_errors import to_user_error
 from repositories.reading_chat_repo import (
     get_or_create_session,
@@ -83,11 +83,20 @@ async def _build_system_prompt(
 
 
 async def _maybe_compress(session, conv, messages):
-    """历史超窗口时压缩：保留最近 keep_recent 条，其余合并为摘要。"""
+    """历史超窗口时压缩：保留最近 keep_recent 条，其余合并为摘要。
+
+    整体思路：先按 context_window 预算判断是否需要压缩，未超预算则直接跳过，
+    避免每轮都调用压缩模型（节省成本与延迟）；只有历史 token 占用超过
+    context_window 时，才把超出 keep_recent 的最旧历史压缩进摘要。
+    """
     keep = conv.keep_recent or 10
     recent = messages[-keep:] if keep > 0 else messages
     to_compress = messages[:-keep] if keep > 0 else []
     summary = conv.compressed_summary or ""
+    # 关键点：context_window 是预算上限，未超预算直接跳过（不改写摘要）。
+    used_tokens = sum(estimate_tokens(m.content) for m in messages)
+    if used_tokens <= (conv.context_window or 4000):
+        return recent, summary
     if not to_compress:
         return recent, summary
 

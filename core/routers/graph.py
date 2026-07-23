@@ -15,7 +15,7 @@
 实现逻辑：
     委托 graph_service；抽取后台任务自开 SessionLocal 落库，避免阻塞请求。
 """
-from fastapi import APIRouter, BackgroundTasks, Depends, Body
+from fastapi import APIRouter, BackgroundTasks, Depends, Body, Query
 
 from models.user import User
 from db import get_session
@@ -23,7 +23,8 @@ from auth.jwt import get_current_user
 from common.response import success
 from common.exceptions import BizError
 from common import task_queue
-from services import graph_service, task_service
+from config import ANALYSIS_MODE_DEFAULT
+from services import graph_service, task_service, fast_analysis_service
 from repositories import novel_repo
 
 # 图谱与抽取：与小说资源同域，挂在 /novels 下
@@ -65,20 +66,28 @@ async def check_graph_exists(
 async def extract_graph(
     novel_id: int,
     background_tasks: BackgroundTasks,
+    mode: str = Query(ANALYSIS_MODE_DEFAULT, pattern="^(turbo|deep)$"),
     user: User = Depends(get_current_user),
     session=Depends(get_session),
 ):
     """实体关系抽取（M5.2 V13重设计）：先清空旧数据，再分块抽取7种实体类型。
     后台调用 LLM 抽取并落库，接口立即返回统一 task_id。
+    mode=turbo：极速关系概览摘要；mode=deep：深度全量图谱抽取。
     """
     novel = await novel_repo.get_novel(session, user.id, novel_id)
     if not novel:
         raise BizError(404, "小说不存在")
     task = await task_service.create_task(
         session, user.id, "graph",
-        f"小说{novel.name}-知识图谱抽取", novel_id=novel_id)
+        f"小说{novel.name}-知识图谱抽取", novel_id=novel_id,
+        extra={"mode": mode})
+    if mode == "turbo":
+        # 极速：单次/少量大上下文调用产出关系概览摘要
+        task_queue.submit(
+            fast_analysis_service.run_turbo, novel_id, user.id, "graph", task.id)
+        return success({"task_id": task.id, "mode": "turbo"}, "已启动极速图谱抽取")
     task_queue.submit(graph_service.run_extract, novel_id, user.id, task.id)
-    return success({"task_id": task.id}, "已启动实体关系抽取（将先清空旧数据后重新抽取）")
+    return success({"task_id": task.id, "mode": "deep"}, "已启动实体关系抽取（将先清空旧数据后重新抽取）")
 
 
 @rt_router.get("/relation-types")

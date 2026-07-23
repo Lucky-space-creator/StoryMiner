@@ -21,7 +21,8 @@ from sqlalchemy import select, delete
 from models.chunk import Chunk
 from schemas.chunk import ChunkRequest
 from repositories import kb_repo, chunk_repo, llm_repo, novel_repo
-from services import chunker, llm_adapters, task_service
+from services import chunker, task_service
+from llm import langchain_factory as llm_adapters
 from common import crypto
 from common import task_cancel
 from common.exceptions import BizError

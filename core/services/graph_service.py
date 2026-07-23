@@ -26,11 +26,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.graph import Entity, Relation
 from repositories import graph_repo, novel_repo, llm_repo
-from services import llm_adapters, task_service
+from services import task_service
 from common import crypto
 from common import task_cancel
 from common import nlp
-from config import USE_LANGCHAIN
 from common.exceptions import BizError
 
 # ───────────────────────────── 实体类型定义（V13 扩展为7种） ─────────────────────────────
@@ -171,21 +170,17 @@ def _pair_context(text: str, a: str, b: str, max_chars: int = 3000) -> str:
     return "\n……\n".join(out)[:max_chars]
 
 
-async def _acall_llm(messages, *, owner_id: int, task_type: str, config_id: int, cfg, use_langchain: bool):
-    """双轨 LLM 调用（M6）：LangChain 工厂 或 旧 adapter。
+async def _acall_llm(messages, *, owner_id: int, task_type: str, config_id: int, cfg):
+    """经 LangChain 调用层发起 LLM 调用（M6）。
 
-    返回 (文本, usage)；LangChain 路径下 usage 已由 invoke_with_usage 写入 story_llm_usage，故返回 None。
+    返回 (文本, usage)；usage 已由 invoke_with_usage 写入 story_llm_usage，故返回 None。
     """
-    if use_langchain:
-        from llm.langchain_factory import get_langchain_model, invoke_with_usage
-        model = get_langchain_model(cfg)
-        resp = await invoke_with_usage(
-            model, messages, owner_id=owner_id, task_type=task_type, config_id=config_id)
-        content = getattr(resp, "content", None)
-        return (content if isinstance(content, str) else str(resp), None)
-    adapter = llm_adapters.get_adapter(cfg, crypto.decrypt(cfg.api_key))
-    text = await adapter.chat(messages)
-    return (text, adapter.get_last_usage())
+    from llm.langchain_factory import get_langchain_model, invoke_with_usage
+    model = get_langchain_model(cfg)
+    resp = await invoke_with_usage(
+        model, messages, owner_id=owner_id, task_type=task_type, config_id=config_id)
+    content = getattr(resp, "content", None)
+    return (content if isinstance(content, str) else str(resp), None)
 
 
 async def _qualify_relations(text: str, topk: list[dict], *, cfg, config_id: int,
@@ -211,7 +206,7 @@ async def _qualify_relations(text: str, topk: list[dict], *, cfg, config_id: int
                     {"role": "user", "content": prompt}]
         raw, _usage = await _acall_llm(
             messages, owner_id=owner_id, task_type="graph_relation",
-            config_id=config_id, cfg=cfg, use_langchain=USE_LANGCHAIN)
+            config_id=config_id, cfg=cfg)
         data = _parse_json(raw)
         if not isinstance(data, dict):
             continue
@@ -232,8 +227,7 @@ async def _qualify_relations(text: str, topk: list[dict], *, cfg, config_id: int
 async def _get_chat_adapter(session: AsyncSession, owner_id: int):
     """取默认对话模型配置（M9 分发链），返回 (cfg, model_name)。
 
-    M8 双轨收敛：USE_LANGCHAIN=true 时仅返回配置信息（LangChain 工厂内部构建模型）；
-    false 时额外创建旧 adapter 作为降级备选。cfg 透传给 M6 关系定性双轨 LLM 调用。
+    返回默认对话模型配置信息（供 LangChain 工厂内部构建模型）；cfg 透传给 M6 关系定性 LLM 调用。
     """
     cfgs = await llm_repo.list_for_dispatch(session, owner_id, "chat")
     if not cfgs:
@@ -433,14 +427,14 @@ async def extract(session: AsyncSession, novel_id: int, owner_id: int, task_id: 
             )
 
         # 调用 LLM：仅抽实体（关系由共现候选边另做定性，降低调用数）
-        # M8 双轨收敛：实体抽取走 _acall_llm，USE_LANGCHAIN=true 时走 LangChain 路径
+        # 实体抽取走 LangChain 调用层（_acall_llm）
         messages = [
             {"role": "system", "content": _ENTITY_SYSTEM},
             {"role": "user", "content": _ENTITY_USER.replace("{candidates}", cand_block).replace("{text}", chunk)},
         ]
         raw, _usage = await _acall_llm(
             messages, owner_id=owner_id, task_type="graph_entity",
-            config_id=config_id, cfg=cfg, use_langchain=USE_LANGCHAIN)
+            config_id=config_id, cfg=cfg)
         data = _parse_json(raw)
 
         chunk_ent = 0

@@ -8,7 +8,7 @@
 关键点：
     1. langgraph 仅在 build_graph() 内 lazy import（仅当 LANGGRAPH_ENABLED 启用、本模块被导入时才触发），
        未安装 langgraph 不影响其他链路。
-    2. analyze 节点复用双轨 LLM（USE_LANGCHAIN）调用，与 M3 一致；出现次数取 nlp 准确 freq。
+    2. analyze 节点复用 LangChain 调用层（M1）发起 LLM 精析；出现次数取 nlp 准确 freq。
     3. session/cfg 通过 config["configurable"] 注入节点，避免全局状态。
 
 实现逻辑：
@@ -21,10 +21,9 @@ from typing import TypedDict
 
 from common import nlp
 from common import crypto
-from config import USE_LANGCHAIN
 from models.character import Character
 from repositories import character_repo
-from services import llm_adapters
+from llm import langchain_factory as llm_adapters
 
 
 class CharacterState(TypedDict, total=False):
@@ -54,21 +53,17 @@ def _parse_json(raw: str) -> dict | list:
         return {}
 
 
-async def _acall(messages, *, owner_id: int, task_type: str, config_id: int, cfg, use_langchain: bool):
-    """双轨 LLM 调用（M7 复用 M3 逻辑）。
+async def _acall(messages, *, owner_id: int, task_type: str, config_id: int, cfg):
+    """经 LangChain 调用层发起人物精析 LLM 调用（M7 复用 M1）。
 
-    返回 (文本, usage)；LangChain 路径下 usage 已由 invoke_with_usage 写入 story_llm_usage，故返回 None。
+    返回 (文本, usage)；usage 已由 invoke_with_usage 写入 story_llm_usage，故返回 None。
     """
-    if use_langchain:
-        from llm.langchain_factory import get_langchain_model, invoke_with_usage
-        model = get_langchain_model(cfg)
-        resp = await invoke_with_usage(
-            model, messages, owner_id=owner_id, task_type=task_type, config_id=config_id)
-        content = getattr(resp, "content", None)
-        return (content if isinstance(content, str) else str(resp), None)
-    adapter = llm_adapters.get_adapter(cfg, crypto.decrypt(cfg.api_key))
-    text = await adapter.chat(messages)
-    return (text, adapter.get_last_usage())
+    from llm.langchain_factory import get_langchain_model, invoke_with_usage
+    model = get_langchain_model(cfg)
+    resp = await invoke_with_usage(
+        model, messages, owner_id=owner_id, task_type=task_type, config_id=config_id)
+    content = getattr(resp, "content", None)
+    return (content if isinstance(content, str) else str(resp), None)
 
 
 _CANDIDATE_PROMPT = """你是小说人物小传撰写助手。请为【指定人物】生成结构化档案。
@@ -117,8 +112,7 @@ async def _analyze_node(state: CharacterState, config) -> CharacterState:
         prompt = _CANDIDATE_PROMPT.replace("{name}", name).replace("{text}", ctx)
         text, _usage = await _acall(
             [{"role": "user", "content": prompt}], owner_id=owner_id,
-            task_type="character_analysis", config_id=config_id, cfg=cfg,
-            use_langchain=USE_LANGCHAIN)
+            task_type="character_analysis", config_id=config_id, cfg=cfg)
         data = _parse_json(text)
         item = data[0] if isinstance(data, list) else data
         if isinstance(item, dict) and item.get("name"):

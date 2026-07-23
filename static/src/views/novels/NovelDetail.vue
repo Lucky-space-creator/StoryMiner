@@ -11,12 +11,22 @@
           <Tag v-for="t in (novel.tags || [])" :key="t" :label="t" />
         </div>
       </div>
-      <div class="flex gap-2 shrink-0">
+      <div class="flex gap-2 shrink-0 items-center">
         <input ref="docsEl" type="file" accept=".txt,.epub,.pdf,.docx" multiple class="hidden" @change="onFiles" />
         <Button variant="secondary" :loading="uploading" @click="docsEl?.click()">上传文档</Button>
         <Button @click="goKb">建知识库</Button>
+        <!-- 分析模式：极速 / 深度思考 -->
+        <span class="flex items-center gap-1 text-xs text-muted ml-1">
+          模式
+          <button type="button" @click="analysisMode = 'turbo'"
+            :class="analysisMode === 'turbo' ? 'px-2 py-1 rounded bg-accent text-white' : 'px-2 py-1 rounded bg-surface2 text-muted'">极速</button>
+          <button type="button" @click="analysisMode = 'deep'"
+            :class="analysisMode === 'deep' ? 'px-2 py-1 rounded bg-accent text-white' : 'px-2 py-1 rounded bg-surface2 text-muted'">深度</button>
+        </span>
         <Button variant="secondary" :loading="analyzing" @click="analyzeNovel">人物分析</Button>
+        <Button variant="ghost" size="sm" @click="viewSummary('character', '人物画像摘要')">人物摘要</Button>
         <Button variant="secondary" :loading="chapterAnalyzing" @click="triggerChapterAnalysis">章节解析</Button>
+        <Button variant="ghost" size="sm" @click="viewSummary('chapter', '情节概览摘要')">章节摘要</Button>
         <Button @click="goReadNovel">阅读小说</Button>
       </div>
     </div>
@@ -111,6 +121,12 @@
     </Modal>
 
     <ConfirmDialog v-model="delOpen" title="删除文档" :message="`确定删除《${pending?.name}》？该文档在所有知识库的切片与向量将一并清除，且不可恢复。`" @confirm="doDelete" />
+
+    <!-- 极速模式摘要弹窗 -->
+    <Modal v-model="summaryOpen" :title="summaryTitle">
+      <div v-if="summaryLoading" class="text-sm text-muted">加载中…</div>
+      <pre v-else class="text-sm text-app whitespace-pre-wrap leading-relaxed max-h-[60vh] overflow-auto">{{ summaryContent }}</pre>
+    </Modal>
   </div>
 </template>
 
@@ -133,7 +149,7 @@ import Input from '@/components/ui/Input.vue'
 import Pagination from '@/components/ui/Pagination.vue'
 import EmptyState from '@/components/ui/EmptyState.vue'
 import ConfirmDialog from '@/components/ui/ConfirmDialog.vue'
-import { getNovel, listNovelDocuments, uploadDocuments, deleteNovelDocument, renameNovelDocument, analyzeChapters, getChapterAnalysis } from '@/api/novels'
+import { getNovel, listNovelDocuments, uploadDocuments, deleteNovelDocument, renameNovelDocument, analyzeChapters, getChapterAnalysis, getAnalysisSummary } from '@/api/novels'
 import { analyzeCharacters } from '@/api/characters'
 import { useToast } from '@/composables/useToast'
 
@@ -146,6 +162,13 @@ const loading = ref(true)
 const uploading = ref(false)
 const analyzing = ref(false)
 const chapterAnalyzing = ref(false)
+// 分析模式：turbo=极速摘要 / deep=深度全量建库（默认极速）
+const analysisMode = ref('turbo')
+// 极速摘要查看（弹窗）
+const summaryOpen = ref(false)
+const summaryTitle = ref('')
+const summaryContent = ref('')
+const summaryLoading = ref(false)
 const chapterAnalysis = ref(null)
 const docsEl = ref(null)
 
@@ -253,8 +276,12 @@ function goKb() {
 async function analyzeNovel() {
   analyzing.value = true
   try {
-    const res = await analyzeCharacters(route.params.id)
-    notify(`人物分析已启动（任务 #${res.data?.task_id || '—'}），可在仪表盘查看进度`, 'info')
+    const res = await analyzeCharacters(route.params.id, analysisMode.value)
+    if (analysisMode.value === 'turbo') {
+      notify(`极速人物分析已启动（任务 #${res.data?.task_id || '—'}），完成后点「人物摘要」查看画像`, 'info')
+    } else {
+      notify(`人物分析已启动（任务 #${res.data?.task_id || '—'}），可在仪表盘查看进度`, 'info')
+    }
   } catch (e) {
     notify(e.message || '启动人物分析失败', 'error')
   } finally {
@@ -266,12 +293,34 @@ async function analyzeNovel() {
 async function triggerChapterAnalysis() {
   chapterAnalyzing.value = true
   try {
-    const res = await analyzeChapters(route.params.id)
-    notify(`章节解析已启动（任务 #${res.data?.task_id || '—'}），可在仪表盘查看进度`, 'info')
+    const res = await analyzeChapters(route.params.id, analysisMode.value)
+    if (analysisMode.value === 'turbo') {
+      notify(`极速章节解析已启动（任务 #${res.data?.task_id || '—'}），完成后点「章节摘要」查看概览`, 'info')
+    } else {
+      notify(`章节解析已启动（任务 #${res.data?.task_id || '—'}），可在仪表盘查看进度`, 'info')
+    }
   } catch (e) {
     notify(e.message || '启动章节解析失败', 'error')
   } finally {
     chapterAnalyzing.value = false
+  }
+}
+
+// 极速摘要查看：拉取该小说的指定类型摘要并弹窗展示
+async function viewSummary(type, title) {
+  summaryOpen.value = true
+  summaryTitle.value = title
+  summaryLoading.value = true
+  summaryContent.value = ''
+  try {
+    const res = await getAnalysisSummary(route.params.id, type)
+    summaryContent.value = res.data?.exists
+      ? (res.data.content || '（摘要为空）')
+      : '（暂无摘要，请先运行极速模式分析）'
+  } catch (e) {
+    summaryContent.value = '读取摘要失败：' + (e.message || e)
+  } finally {
+    summaryLoading.value = false
   }
 }
 

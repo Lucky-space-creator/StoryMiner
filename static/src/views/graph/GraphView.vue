@@ -17,6 +17,15 @@
         <Button @click="openCreateEntity">新增实体</Button>
         <Button @click="openCreateRelation">新增关系</Button>
         <Button @click="handleExtract">抽取实体</Button>
+        <!-- 分析模式：极速 / 深度思考 -->
+        <span class="flex items-center gap-1 text-xs text-muted ml-1">
+          模式
+          <button type="button" @click="graphMode = 'turbo'"
+            :class="graphMode === 'turbo' ? 'px-2 py-1 rounded bg-accent text-white' : 'px-2 py-1 rounded bg-surface2 text-muted'">极速</button>
+          <button type="button" @click="graphMode = 'deep'"
+            :class="graphMode === 'deep' ? 'px-2 py-1 rounded bg-accent text-white' : 'px-2 py-1 rounded bg-surface2 text-muted'">深度</button>
+        </span>
+        <Button variant="ghost" size="sm" @click="viewGraphSummary">关系摘要</Button>
       </div>
     </div>
 
@@ -67,6 +76,12 @@
       confirm-text="确认抽取"
       @confirm="onConfirmExtract"
     />
+
+    <!-- 极速模式摘要弹窗 -->
+    <Modal v-model="summaryOpen" :title="summaryTitle">
+      <div v-if="summaryLoading" class="text-sm text-muted">加载中…</div>
+      <pre v-else class="text-sm text-app whitespace-pre-wrap leading-relaxed max-h-[60vh] overflow-auto">{{ summaryContent }}</pre>
+    </Modal>
   </div>
 </template>
 
@@ -78,12 +93,13 @@ import Card from '@/components/ui/Card.vue'
 import Button from '@/components/ui/Button.vue'
 import Skeleton from '@/components/ui/Skeleton.vue'
 import ConfirmDialog from '@/components/ui/ConfirmDialog.vue'
+import Modal from '@/components/ui/Modal.vue'
 import EntityModal from '@/components/graph/EntityModal.vue'
 import RelationModal from '@/components/graph/RelationModal.vue'
 import {
   getGraph, extractGraph, getRelationTypes, deleteEntity, deleteRelation, checkGraphExists, getEntityTypes
 } from '@/api/graph'
-import { listNovels } from '@/api/novels'
+import { listNovels, getAnalysisSummary } from '@/api/novels'
 import { useToast } from '@/composables/useToast'
 import { useTaskProgressStore } from '@/stores/taskProgress'
 
@@ -96,6 +112,14 @@ const isEmpty = ref(false)
 const novels = ref([])
 const currentNovel = ref(Number(route.params.id) || null)
 const myTaskId = ref(null)
+// 分析模式：turbo=极速关系概览 / deep=深度全量图谱（默认极速）
+const graphMode = ref('turbo')
+const lastExtractMode = ref('deep')
+// 极速摘要弹窗
+const summaryOpen = ref(false)
+const summaryTitle = ref('')
+const summaryContent = ref('')
+const summaryLoading = ref(false)
 const currentNodes = ref([])
 const relationTypes = ref([])
 // 弹窗与删除确认状态
@@ -315,7 +339,8 @@ async function onConfirmExtract() {
 // 实际执行抽取（提交后台任务）
 async function doExtract() {
   try {
-    const res = await extractGraph(currentNovel.value)
+    lastExtractMode.value = graphMode.value
+    const res = await extractGraph(currentNovel.value, graphMode.value)
     const taskId = res.data?.task_id
     if (!taskId) {
       notify('已触发实体关系抽取，请稍后刷新查看图谱。', 'success')
@@ -328,19 +353,43 @@ async function doExtract() {
       progress: 0, stage: '已提交，正在清空旧数据…', status: 'running'
     })
     taskStore.show()
-    notify('已提交，正在后台处理中…', 'info')
+    if (graphMode.value === 'turbo') {
+      notify('极速图谱抽取已提交，完成后自动展示关系概览。', 'info')
+    } else {
+      notify('已提交，正在后台处理中…', 'info')
+    }
   } catch (e) {
     notify(e?.message || '抽取触发失败', 'error')
   }
 }
 
-// 监听本页抽取任务完成：由全局轮询更新 store，这里重载图谱
+// 极速摘要查看：拉取图谱关系概览并弹窗展示
+async function viewGraphSummary() {
+  if (!currentNovel.value) return
+  summaryOpen.value = true
+  summaryTitle.value = '关系概览摘要'
+  summaryLoading.value = true
+  summaryContent.value = ''
+  try {
+    const res = await getAnalysisSummary(currentNovel.value, 'graph')
+    summaryContent.value = res.data?.exists
+      ? (res.data.content || '（摘要为空）')
+      : '（暂无摘要，请先运行极速模式分析）'
+  } catch (e) {
+    summaryContent.value = '读取摘要失败：' + (e?.message || e)
+  } finally {
+    summaryLoading.value = false
+  }
+}
+
+// 监听本页抽取任务完成：由全局轮询更新 store，这里重载图谱；极速模式自动展示摘要
 watch(
   () => taskStore.tasks.find((t) => t.id === myTaskId.value)?.status,
   async (s) => {
     if (s === 'success' && myTaskId.value) {
       myTaskId.value = null
       await loadGraph()
+      if (lastExtractMode.value === 'turbo') viewGraphSummary()
     } else if (s === 'failed') {
       myTaskId.value = null
     }

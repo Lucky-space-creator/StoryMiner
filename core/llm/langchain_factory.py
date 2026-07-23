@@ -1,63 +1,195 @@
 """
-LangChain 模型工厂（混合分析管道 M1 / LangChain 接入第一板块 A）
+LangChain 模型工厂与统一适配器（混合分析管道 M1 / 全面接入 LangChain 调用层）
 
 整体思路：
-    用 LangChain 的 ChatOpenAI / ChatOllama 替代自研 llm_adapters 的「单次 LLM 调用」，
-    统一管理模型构造、api_key 解密、用量回写；业务层经双轨开关 USE_LANGCHAIN 决定是否走本工厂。
+    本项目所有大模型调用（对话 chat / 流式 chat_stream / 向量嵌入 embed / 健康探测 health）
+    统一收敛到 LangChain 的 ChatModel / Embeddings 之上，对外暴露与历史用法完全兼容的
+    LangChainAdapter（提供 chat / chat_stream / embed / health / get_last_usage 与
+    get_adapter(cfg, api_key) 工厂），从而彻底替换自研 services.llm_adapters，避免双份维护成本。
 
 关键点：
-    1. 仅负责「执行单次调用」，降级选路仍由 repositories.llm_repo.list_for_dispatch 承担。
-    2. api_key 经 common.crypto.decrypt 解密，禁止明文；工厂是唯一解密点。
-    3. LangChain 相关 import 延迟到函数内，避免未安装/未启用时拖慢启动或导入失败（呼应风险缓解）。
-    4. 用量经 invoke_with_usage 包装，复用 services.task_service.record_llm_usage，零改动统计表。
+    1. 适配器仅做"薄封装"：异步调用、用量统计、超时、流式聚合；业务语义仍由各 service 决定。
+    2. provider 自动分流：openai 兼容走 ChatOpenAI + OpenAIEmbeddings；ollama 走 ChatOllama + OllamaEmbeddings。
+    3. api_key 由本层统一从配置解密（get_adapter 透传的 api_key 仅为兼容旧签名，实际以 cfg 内密文为准）。
 
 实现逻辑：
-    get_langchain_model(config, **kw)：按 provider 构造 ChatOpenAI / ChatOllama；
-    invoke_with_usage(...)：ainvoke + 提取 usage_metadata 回写 story_llm_usage。
+    get_adapter → LangChainAdapter(cfg) → 构造时构建 model 与 embeddings →
+    chat / chat_stream 经 model.ainvoke / model.astream 调用并把 usage_metadata
+    归一化到 {tokens_in, tokens_out}；embed 经 embeddings.aembed_documents。
 """
+import logging
+import os
+import time
+
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_ollama import ChatOllama, OllamaEmbeddings
+
+from common import crypto
 from models.llm_config import LLMConfig
-from common.crypto import decrypt
 
-from langchain_openai import ChatOpenAI
-from langchain_ollama import ChatOllama
+logger = logging.getLogger(__name__)
+
+CHAT_TIMEOUT = float(os.getenv("LLM_CHAT_TIMEOUT", "240"))
 
 
-def get_langchain_model(config: LLMConfig, **kw):
-    """LLMConfig → LangChain 聊天模型，替代 llm_adapters.get_adapter。
+def _norm_base_url(base_url: str) -> str:
+    """规范化 base_url：去除尾随斜杠。"""
+    if not base_url:
+        return ""
+    return base_url.rstrip("/")
 
-    局部延迟导入 LangChain，避免全局加载；未安装 LangChain 时不触发 ImportError。
-    provider == 'ollama' → ChatOllama（本地，无需 api_key）；其余 → ChatOpenAI 兼容协议。
+
+def _build_openai(cfg: LLMConfig):
+    """构造 openai 兼容 ChatOpenAI（含 base_url / api_key 解密 / 超时）。"""
+    api_key = crypto.decrypt(cfg.api_key) if cfg.api_key else None
+    kwargs = dict(
+        model=cfg.model,
+        api_key=api_key,
+        temperature=cfg.temperature or 0.7,
+        base_url=_norm_base_url(cfg.base_url) or None,
+        timeout=CHAT_TIMEOUT,
+        max_retries=2,
+    )
+    if cfg.max_tokens:
+        kwargs["max_tokens"] = cfg.max_tokens
+    return ChatOpenAI(**kwargs)
+
+
+def _build_ollama(cfg: LLMConfig):
+    """构造本地 ChatOllama（无需 api_key，max_tokens 映射为 num_predict）。"""
+    kwargs = dict(
+        model=cfg.model,
+        base_url=_norm_base_url(cfg.base_url) or "http://localhost:11434",
+        temperature=cfg.temperature or 0.7,
+        timeout=CHAT_TIMEOUT,
+    )
+    if cfg.max_tokens:
+        kwargs["num_predict"] = cfg.max_tokens
+    return ChatOllama(**kwargs)
+
+
+def get_langchain_model(cfg: LLMConfig):
+    """LLMConfig → LangChain 聊天模型，按 provider 自动分流（openai 兼容 / ollama）。"""
+    provider = (cfg.provider or "").strip().lower()
+    if provider == "ollama":
+        return _build_ollama(cfg)
+    return _build_openai(cfg)
+
+
+def _build_embeddings(cfg: LLMConfig):
+    """LLMConfig → LangChain Embeddings，与 chat 同源 provider 分流。"""
+    provider = (cfg.provider or "").strip().lower()
+    api_key = crypto.decrypt(cfg.api_key) if cfg.api_key else None
+    base_url = _norm_base_url(cfg.base_url) or None
+    if provider == "ollama":
+        return OllamaEmbeddings(model=cfg.model, base_url=base_url or "http://localhost:11434")
+    return OpenAIEmbeddings(model=cfg.model, api_key=api_key, base_url=base_url)
+
+
+def _text_of(message) -> str:
+    """把 LangChain 的 AIMessage / AIMessageChunk 内容统一成字符串。"""
+    content = getattr(message, "content", None)
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(item.get("text") or item.get("content") or "")
+            else:
+                parts.append(str(item))
+        return "".join(parts)
+    return str(content)
+
+
+def _extract_usage(message) -> dict | None:
+    """从 LangChain 消息的 usage_metadata 归一化出 {tokens_in, tokens_out}。"""
+    meta = getattr(message, "usage_metadata", None)
+    if not meta:
+        return None
+    return {
+        "tokens_in": int(meta.get("input_tokens") or 0),
+        "tokens_out": int(meta.get("output_tokens") or 0),
+    }
+
+
+class LangChainAdapter:
+    """LangChain 实现的大模型适配器，替代旧 services.llm_adapters。
+
+    提供原接口：chat / chat_stream / embed / health / get_last_usage，
+    调用方代码（各 service）仅需替换 import 即可无缝切换。
     """
 
-    temperature = kw.get("temperature", 0.3)
-    timeout = config.timeout or 300
-    provider = (config.provider or "").strip().lower()
+    def __init__(self, cfg: LLMConfig, api_key: str | None = None):
+        self.cfg = cfg
+        self._model = get_langchain_model(cfg)
+        self._embeddings = None
+        self._last_usage = None
 
-    if provider == "ollama":
-        return ChatOllama(
-            base_url=config.base_url or "http://localhost:11434",
-            model=config.model,
-            temperature=temperature,
-            timeout=timeout,
-        )
+    def _bind(self, **opts):
+        """把业务侧透传的采样参数（temperature/max_tokens/top_p/stop 等）绑定到模型。"""
+        filtered = {
+            k: v
+            for k, v in opts.items()
+            if k in ("temperature", "max_tokens", "top_p", "stop", "presence_penalty", "frequency_penalty")
+            and v is not None
+        }
+        if not filtered:
+            return self._model
+        # ollama 用 num_predict 表达 max_tokens，做兼容转换
+        if (self.cfg.provider or "").strip().lower() == "ollama" and "max_tokens" in filtered:
+            filtered["num_predict"] = filtered.pop("max_tokens")
+        return self._model.bind(**filtered)
 
-    api_key = decrypt(config.api_key) if config.api_key else None
-    return ChatOpenAI(
-        base_url=config.base_url,
-        api_key=api_key,
-        model=config.model,
-        temperature=temperature,
-        timeout=timeout,
-        max_retries=kw.get("max_retries", 2),
-    )
+    async def chat(self, messages: list, **opts) -> str:
+        """单次对话调用，返回文本，并把用量写入 _last_usage。"""
+        resp = await self._bind(**opts).ainvoke(messages)
+        self._last_usage = _extract_usage(resp)
+        return _text_of(resp)
+
+    async def chat_stream(self, messages: list, **opts):
+        """流式对话，逐块 yield 文本片段，并尽力捕获末块用量。"""
+        async for chunk in self._bind(**opts).astream(messages):
+            text = _text_of(chunk)
+            if text:
+                yield text
+            usage = _extract_usage(chunk)
+            if usage:
+                self._last_usage = usage
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        """批量文本向量化，返回与输入同序的向量列表。"""
+        if self._embeddings is None:
+            self._embeddings = _build_embeddings(self.cfg)
+        return await self._embeddings.aembed_documents(texts)
+
+    async def health(self) -> tuple[bool, int, str]:
+        """健康探测：以一次极简 ainvoke 验证连通性，返回 (是否可用, 延迟ms, 详情)。"""
+        t0 = time.perf_counter()
+        try:
+            await self._model.ainvoke([{"role": "user", "content": "ping"}])
+            latency = int((time.perf_counter() - t0) * 1000)
+            return True, latency, "ok"
+        except Exception as e:  # noqa: BLE001
+            latency = int((time.perf_counter() - t0) * 1000)
+            return False, latency, str(e)[:200]
+
+    def get_last_usage(self) -> dict | None:
+        """返回最近一次调用的归一化用量 {tokens_in, tokens_out}。"""
+        return self._last_usage
+
+
+def get_adapter(cfg: LLMConfig, api_key: str | None = None) -> LangChainAdapter:
+    """工厂方法：构造 LangChain 适配器。
+
+    参数 api_key 仅为兼容旧签名（旧代码先 crypto.decrypt 再传入），本层实际以 cfg 内密文为准，
+    故透传值不参与构造。
+    """
+    return LangChainAdapter(cfg, api_key)
 
 
 async def invoke_with_usage(model, prompt_value, *, owner_id, task_type, config_id=None):
-    """执行调用并回写用量（复用现有 record_llm_usage）。
-
-    LangChain 的 AIMessage.usage_metadata 提供 {input_tokens, output_tokens}，
-    包装为与旧 adapter 一致的 story_llm_usage 记录，零改动现有统计/仪表盘。
-    """
+    """执行调用并回写用量（复用现有 record_llm_usage），供需要即时记录用量的场景使用。"""
     resp = await model.ainvoke(prompt_value)
     meta = getattr(resp, "usage_metadata", None) or {}
     from services.task_service import record_llm_usage

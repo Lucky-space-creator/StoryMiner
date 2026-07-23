@@ -13,6 +13,7 @@
     委托 novel_service / parse_service；SSE 用 StreamingResponse。
 """
 from fastapi import APIRouter, Depends, UploadFile, BackgroundTasks, Query
+from sqlalchemy import select
 
 from models.user import User
 from db import get_session
@@ -20,9 +21,14 @@ from auth.jwt import get_current_user
 from common.response import success, paginate
 from common.exceptions import BizError
 from common import task_queue
+from config import ANALYSIS_MODE_DEFAULT
 from schemas.novel import NovelCreate, NovelUpdate, ChapterCorrect, ChapterSplit, ChapterMerge
-from services import novel_service, parse_service, kb_service, chapter_analysis_service, task_service
+from services import (
+    novel_service, parse_service, kb_service, chapter_analysis_service,
+    task_service, fast_analysis_service,
+)
 from repositories import novel_repo
+from models.analysis_summary import StoryAnalysisSummary
 
 router = APIRouter(prefix="/novels", tags=["novels"])
 
@@ -158,6 +164,7 @@ async def merge_chapters(
 async def trigger_chapter_analysis(
     novel_id: int,
     background_tasks: BackgroundTasks,
+    mode: str = Query(ANALYSIS_MODE_DEFAULT, pattern="^(turbo|deep)$"),
     user: User = Depends(get_current_user),
     session=Depends(get_session),
 ):
@@ -171,6 +178,7 @@ async def trigger_chapter_analysis(
         1. 需小说下有章节数据，否则返回错误提示。
         2. 同一小说可多次触发，每次覆盖之前的分析结果（幂等写入 extra 字段）。
         3. 返回 task_id 供前端跳转仪表盘查看进度。
+        4. mode=turbo：极速摘要（情节概览）；mode=deep：深度全量逐章解析。
     """
     novel = await novel_repo.get_novel(session, user.id, novel_id)
     if not novel:
@@ -179,7 +187,13 @@ async def trigger_chapter_analysis(
     task = await task_service.create_task(
         session, user.id, type="chapter_analysis",
         name=f"章节解析·{novel.name}", novel_id=novel_id,
+        extra={"mode": mode},
     )
+    if mode == "turbo":
+        # 极速：单次/少量大上下文调用产出情节概览摘要
+        task_queue.submit(
+            fast_analysis_service.run_turbo, novel_id, user.id, "chapter", task.id)
+        return success({"task_id": task.id, "novel_id": novel_id, "mode": "turbo"}, "极速章节解析任务已启动")
     # 提交后台任务（入全局串行队列，逐一执行；排队中前端显示「排队中」）
     task_queue.submit(
         chapter_analysis_service.analyze_chapters,
@@ -187,7 +201,35 @@ async def trigger_chapter_analysis(
         novel_name=novel.name, summary=novel.summary or "",
         async_task_id=task.id,
     )
-    return success({"task_id": task.id, "novel_id": novel_id}, "章节解析任务已启动")
+    return success({"task_id": task.id, "novel_id": novel_id, "mode": "deep"}, "章节解析任务已启动")
+
+
+@router.get("/{novel_id}/analysis-summary")
+async def get_analysis_summary(
+    novel_id: int,
+    analysis_type: str = Query("character", pattern="^(character|chapter|graph)$"),
+    user: User = Depends(get_current_user),
+    session=Depends(get_session),
+):
+    """读取极速模式摘要（按小说 + 类型），供前端极速结果展示。
+
+    返回 {exists, content, fmt, updated_at}；深度模式未产出摘要时 exists=false。
+    """
+    novel = await novel_repo.get_novel(session, user.id, novel_id)
+    if not novel:
+        raise BizError(404, "小说不存在")
+    row = (await session.execute(
+        select(StoryAnalysisSummary).where(
+            StoryAnalysisSummary.novel_id == novel_id,
+            StoryAnalysisSummary.analysis_type == analysis_type))).scalars().first()
+    if not row:
+        return success({"exists": False, "content": "", "fmt": "markdown", "updated_at": None})
+    return success({
+        "exists": True,
+        "content": row.content,
+        "fmt": row.fmt,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    })
 
 
 @router.get("/{novel_id}/chapter-analysis")

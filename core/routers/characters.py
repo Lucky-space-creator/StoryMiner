@@ -12,7 +12,7 @@
 实现逻辑：
     委托 character_service；归属校验在 service 内完成，路由仅做参数传递。
 """
-from fastapi import APIRouter, Depends, BackgroundTasks
+from fastapi import APIRouter, Depends, BackgroundTasks, Query
 from pydantic import BaseModel
 
 from models.user import User
@@ -21,7 +21,8 @@ from auth.jwt import get_current_user
 from common.response import success
 from common.exceptions import BizError
 from common import task_queue
-from services import character_service, task_service
+from config import ANALYSIS_MODE_DEFAULT
+from services import character_service, task_service, fast_analysis_service
 from repositories import character_repo, novel_repo
 
 # 列表/新建：与小说资源同域
@@ -127,12 +128,14 @@ async def generate_profile(
 async def analyze_characters(
     novel_id: int,
     background_tasks: BackgroundTasks,
+    mode: str = Query(ANALYSIS_MODE_DEFAULT, pattern="^(turbo|deep)$"),
     user: User = Depends(get_current_user),
     session=Depends(get_session),
 ):
     """任务分析（小说详情页）：基于小说简介和正文，LLM 自动分析并创建人物档案。
 
     后台异步执行，立即返回统一 task_id 供仪表盘轮询进度。
+    mode=turbo：极速摘要（大上下文少调用，秒~分钟出人物画像）；mode=deep：深度全量建库。
     """
     novel = await novel_repo.get_novel(session, user.id, novel_id)
     if not novel:
@@ -140,11 +143,17 @@ async def analyze_characters(
     task = await task_service.create_task(
         session, user.id, "character_analysis",
         f"小说{novel.name}-人物分析", novel_id=novel_id,
+        extra={"mode": mode},
     )
+    if mode == "turbo":
+        # 极速：单次/少量大上下文调用产出人物画像摘要，不建结构化库
+        task_queue.submit(
+            fast_analysis_service.run_turbo, novel_id, user.id, "character", task.id)
+        return success({"task_id": task.id, "mode": "turbo"}, "已启动极速人物分析")
     task_queue.submit(
         character_service.analyze_and_create_characters,
         novel_id=novel_id, owner_id=user.id,
         novel_name=novel.name, summary=novel.summary or "",
         async_task_id=task.id,
     )
-    return success({"task_id": task.id}, "已启动人物分析")
+    return success({"task_id": task.id, "mode": "deep"}, "已启动人物分析")

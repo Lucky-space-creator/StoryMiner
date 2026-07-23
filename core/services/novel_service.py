@@ -23,7 +23,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from schemas.novel import NovelCreate, NovelUpdate, ChapterCorrect, ChapterSplit, ChapterMerge
 from models.novel_content import Novel, Chapter, Document, KnowledgeBase
 from repositories import novel_repo, llm_repo
-from services import llm_adapters, task_service
+from services import task_service
+from llm import langchain_factory as llm_adapters
 from storage import delete as storage_delete
 from vectorstore.factory import get_vector_store
 from common import crypto

@@ -23,12 +23,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.character import Character
 from repositories import character_repo, novel_repo, llm_repo
-from services import llm_adapters, task_service
+from services import task_service
+from llm import langchain_factory as llm_adapters
 from common import crypto
 from common import task_cancel
 from common.exceptions import BizError
 from common import nlp
-from config import USE_LANGCHAIN, LANGGRAPH_ENABLED
+from config import LANGGRAPH_ENABLED
 
 logger = logging.getLogger(__name__)
 
@@ -401,22 +402,17 @@ def _extract_context(text: str, name: str, max_chars: int = 4000) -> str:
     return "\n……\n".join(snippets)[:max_chars]
 
 
-async def _call_llm(messages, *, owner_id, task_type, config_id, cfg, use_langchain):
-    """双轨 LLM 调用（M1/M3）：LangChain 工厂 或 旧 adapter。
+async def _call_llm(messages, *, owner_id, task_type, config_id, cfg):
+    """经 LangChain 调用层发起 LLM 调用（M1/M3）。
 
-    返回 (文本, usage)；LangChain 路径下 usage 已由 invoke_with_usage 写入 story_llm_usage，
-    故此处返回 None 避免上层重复统计；旧 adapter 路径返回 adapter.get_last_usage() 供累计。
+    返回 (文本, usage)；usage 已由 invoke_with_usage 写入 story_llm_usage，故返回 None。
     """
-    if use_langchain:
-        from llm.langchain_factory import get_langchain_model, invoke_with_usage
-        model = get_langchain_model(cfg)
-        resp = await invoke_with_usage(
-            model, messages, owner_id=owner_id, task_type=task_type, config_id=config_id)
-        content = getattr(resp, "content", None)
-        return (content if isinstance(content, str) else str(resp), None)
-    adapter = llm_adapters.get_adapter(cfg, crypto.decrypt(cfg.api_key))
-    text = await adapter.chat(messages)
-    return (text, adapter.get_last_usage())
+    from llm.langchain_factory import get_langchain_model, invoke_with_usage
+    model = get_langchain_model(cfg)
+    resp = await invoke_with_usage(
+        model, messages, owner_id=owner_id, task_type=task_type, config_id=config_id)
+    content = getattr(resp, "content", None)
+    return (content if isinstance(content, str) else str(resp), None)
 
 
 async def _analyze_candidates(session, novel_id, owner_id, full_text, cands, async_task_id):
@@ -430,7 +426,6 @@ async def _analyze_candidates(session, novel_id, owner_id, full_text, cands, asy
         raise BizError(400, "尚未配置对话模型（llm_type=chat），请先在模型管理中添加")
     cfg = cfgs[0]
     config_id = cfg.id
-    use_lc = USE_LANGCHAIN
     n = len(cands)
     created = skipped = 0
     tok_in = tok_out = 0
@@ -453,7 +448,7 @@ async def _analyze_candidates(session, novel_id, owner_id, full_text, cands, asy
         messages = [{"role": "user", "content": prompt}]
         text, usage = await _call_llm(
             messages, owner_id=owner_id, task_type="character_analysis",
-            config_id=config_id, cfg=cfg, use_langchain=use_lc)
+            config_id=config_id, cfg=cfg)
         if usage:
             tok_in += usage.get("tokens_in", 0)
             tok_out += usage.get("tokens_out", 0)

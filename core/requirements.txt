@@ -27,3 +27,9 @@ cachetools>=5.3
 # 混合分析管道 M7：LangGraph 工作流编排层（状态图 extract→analyze→persist）
 # 固定 0.2.x 系列以兼容现有 langchain 0.3.x / langchain-core 0.3.x（1.x 会强升 core 至 1.x 破坏兼容）
 langgraph>=0.2,<0.3
+
+# 混合分析管道 L1/L2：性能优化（连接池已内置于 SQLAlchemy，仅补齐异步任务依赖）
+# L2 异步任务架构：Celery + Redis broker（多 worker 并行，替代进程内串行队列）
+celery>=5.3,<6
+# redis-py 8.x 兼容本机老 Redis 3.2.100 需在客户端以 protocol=2 协商（见 common/redis_client.py）
+redis>=5.0

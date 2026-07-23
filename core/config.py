@@ -102,13 +102,13 @@ MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", _minio.get("secret_key", "minio
 MINIO_BUCKET = os.getenv("MINIO_BUCKET", _minio.get("bucket", "story-rag"))
 MINIO_SECURE = str(os.getenv("MINIO_SECURE", _minio.get("secure", "false"))).lower() == "true"
 
-# 双轨开关：LangChain / LangGraph 接入（混合分析管道 M1）
-#   false（默认）：service 走旧 llm_adapters + task_service 线性流程
-#   true：走 langchain_factory / LangGraph 路径（后续阶段）
-# 配置源优先级：环境变量 USE_LANGCHAIN > config.yml langchain.enabled > 默认 false
+# LangChain 调用层总开关（混合分析管道 M1）：所有大模型调用已统一收敛到 LangChain
+# （langchain_factory.LangChainAdapter），旧 llm_adapters 已删除，本开关保留仅作环境兼容，
+# 不再切换调用实现。默认 true。
+# 配置源优先级：环境变量 USE_LANGCHAIN > config.yml langchain.enabled > 默认 true
 USE_LANGCHAIN = (
     str(os.getenv("USE_LANGCHAIN", _cfg.get("langchain", {}).get("enabled", "true")))
-    .lower() == "true"
+    .lower() not in ("0", "false", "no", "off")
 )
 
 # 结果缓存开关（混合分析管道 M5 P3）：默认关，真实集成验证时置 true 启用进程内 TTL 缓存
@@ -123,4 +123,80 @@ ENABLE_LLM_CACHE = (
 LANGGRAPH_ENABLED = (
     str(os.getenv("LANGGRAPH_ENABLED", _cfg.get("langgraph", {}).get("enabled", "false")))
     .lower() == "true"
+)
+
+# ───────────────────────────────────────────────────────────────────────────
+# L1 数据库连接池治理（混合分析管道性能优化）
+#   全流程解析/切章/人物/章节/图谱分析并发会话较多，默认池太小(5)会耗尽连接。
+#   默认 pool_size=20 显著大于 asyncpg 的 5，并开启 pre_ping 规避 PG 断连。
+# ───────────────────────────────────────────────────────────────────────────
+_database = _cfg.get("database", {})
+DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", _database.get("pool_size", 20)))
+DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", _database.get("max_overflow", 10)))
+DB_POOL_TIMEOUT = int(os.getenv("DB_POOL_TIMEOUT", _database.get("pool_timeout", 30)))
+DB_POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", _database.get("pool_recycle", 1800)))
+DB_POOL_PRE_PING = (
+    str(os.getenv("DB_POOL_PRE_PING", _database.get("pool_pre_ping", "true"))).lower() == "true"
+)
+
+# ───────────────────────────────────────────────────────────────────────────
+# L2 异步任务架构（Redis + Celery）—— 性能优化核心跃迁
+#   现行 common.task_queue 是「单 worker 进程内串行 asyncio.Queue」，任何大模型
+#   分析任务都只能排队逐一执行，全流程约 10h。L2 引入 Celery + Redis broker，
+#   把任务分发到多 worker 并行执行，实现 8~12 worker 真并行。
+#   关键约束：本机 Redis 为 3.2.100（老版本），redis-py 须用 protocol=2 兼容。
+#   默认 USE_CELERY=false（opt-in），未装 celery 时回落到原串行队列，零破坏。
+# ───────────────────────────────────────────────────────────────────────────
+_redis = _cfg.get("redis", {})
+REDIS_URL = os.getenv("REDIS_URL", _redis.get("url", "redis://127.0.0.1:6363/0"))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", _redis.get("password", "")) or None
+
+_pipeline = _cfg.get("pipeline", {})
+USE_CELERY = str(os.getenv("USE_CELERY", _pipeline.get("async_mode", "false"))).lower() == "true"
+CELERY_WORKER_CONCURRENCY = int(os.getenv("CELERY_WORKER_CONCURRENCY", _pipeline.get("worker_concurrency", 8)))
+
+# celery 可用性探测（导入期不强制依赖；未安装则 CELERY_AVAILABLE=False，回落串行）
+try:
+    import celery  # noqa: F401
+
+    CELERY_AVAILABLE = True
+except Exception:
+    CELERY_AVAILABLE = False
+
+# 在协程中运行同步/异步可调用体的辅助器（供 Celery worker 调用本项目 async 任务函数）
+import asyncio
+
+
+def run_async(coro_callable):
+    """在线程/进程内执行一个协程可调用体，避免每个任务重复 asyncio.run 样板。
+
+    实现逻辑：
+        取当前运行时事件循环；若已存在且未关闭则直接执行，否则新建循环。
+        Celery 的 prefork worker 每个进程有独立线程，首次调用时建循环即可复用。
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("loop closed")
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coro_callable)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# 分析模式（极速 / 深度思考）—— 小说分析双模式入口
+#   极速(turbo)：用 1~N 次大上下文调用产出「人物画像/情节概览/关系概览」散文摘要，
+#               秒~分钟级，不建全量结构化库，与深度库并存（见 fast_analysis_service）。
+#   深度(deep) ：走原有全量建库逻辑（人物档案/章节解析/图谱抽取），逐实体落结构化库。
+#   默认极速：用户未显式选择时走极速，最快拿到可读摘要。
+# ───────────────────────────────────────────────────────────────────────────
+_analysis = _cfg.get("analysis", {})
+ANALYSIS_MODE_DEFAULT = (
+    str(os.getenv("ANALYSIS_MODE_DEFAULT", _analysis.get("mode_default", "turbo"))).lower()
+)
+# 极速模式单次投喂模型的最大正文字符数：模型上下文越大可上调（如 200000+），
+# 越大则调用次数越少、越接近网页版「一次读完全书」体验。
+TURBO_MAX_INPUT_CHARS = int(
+    os.getenv("TURBO_MAX_INPUT_CHARS", _analysis.get("turbo_max_input_chars", 120000))
 )

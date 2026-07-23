@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models.novel_content import Novel, Chapter
 from models.story_writing import ContinueWrite
 from repositories import novel_repo, character_repo, writing_repo, llm_repo
-from services import llm_adapters
+from llm import langchain_factory as llm_adapters
 from common import crypto
 from common.exceptions import BizError
 

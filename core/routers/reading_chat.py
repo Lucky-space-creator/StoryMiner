@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 
 from auth.jwt import get_current_user
+from common.response import success
 from db import get_session
 from storage import save as storage_save
 from repositories.reading_chat_repo import (
@@ -51,7 +52,7 @@ async def get_chat(
     """获取会话与历史消息（未压缩）。"""
     conv = await get_or_create_session(session, user.id, novel_id)
     msgs = await list_messages(session, conv.id)
-    return {
+    return success({
         "session": {
             "id": conv.id,
             "title": conv.title,
@@ -71,7 +72,7 @@ async def get_chat(
             }
             for m in msgs
         ],
-    }
+    })
 
 
 @router.put("/{novel_id}/reading-chat")
@@ -92,7 +93,7 @@ async def put_settings(
         system_prompt=body.system_prompt,
     )
     await session.commit()
-    return {"ok": True}
+    return success({"ok": True})
 
 
 @router.delete("/{novel_id}/reading-chat")
@@ -103,7 +104,7 @@ async def clear_chat(
     conv = await get_or_create_session(session, user.id, novel_id)
     await clear_messages(session, conv.id)
     await session.commit()
-    return {"ok": True}
+    return success({"ok": True})
 
 
 @router.post("/{novel_id}/reading-chat/attachments")
@@ -124,4 +125,4 @@ async def upload_attachment(
     key, _ = await storage_save(
         user.id, novel_id, file.filename or f"attach{ext}", data
     )
-    return {"key": key, "name": file.filename, "size": len(data)}
+    return success({"key": key, "name": file.filename, "size": len(data)})

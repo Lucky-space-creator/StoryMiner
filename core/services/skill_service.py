@@ -20,7 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.skill import Skill
 from repositories import skill_repo
-from services import prompt_render, llm_adapters
+from services import prompt_render
+from llm import langchain_factory as llm_adapters
 from common import crypto
 from common.exceptions import BizError
 from repositories import llm_repo
