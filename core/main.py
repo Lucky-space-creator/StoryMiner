@@ -110,6 +110,40 @@ async def lifespan(app: FastAPI):
             ))
         except Exception:
             pass
+        # V18：LLM 配置采样参数（story_llm_config.temperature / max_tokens）。
+        # create_all 不会给已存在的表加列，缺失会导致 langchain_factory 读取
+        # cfg.temperature 时抛 AttributeError，阅读助手等对话功能全部 500。
+        try:
+            from sqlalchemy import text
+            await conn.execute(text(
+                "ALTER TABLE story_llm_config ADD COLUMN IF NOT EXISTS temperature double precision NOT NULL DEFAULT 0.7"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE story_llm_config ADD COLUMN IF NOT EXISTS max_tokens integer"
+            ))
+        except Exception:
+            pass
+        # V19：长任务差异化展示（story_async_task.estimated_duration_minutes / is_long_task / estimated_complete_at）。
+        # create_all 不会给已存在的表加列，显式 ALTER 补齐（幂等）。
+        try:
+            from sqlalchemy import text
+            await conn.execute(text(
+                "ALTER TABLE story_async_task ADD COLUMN IF NOT EXISTS estimated_duration_minutes integer"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE story_async_task ADD COLUMN IF NOT EXISTS is_long_task boolean NOT NULL DEFAULT false"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE story_async_task ADD COLUMN IF NOT EXISTS estimated_complete_at timestamp with time zone"
+            ))
+            # 部分索引加速长任务按状态筛选
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_async_task_long "
+                "ON story_async_task (owner_id, is_long_task, status) "
+                "WHERE is_long_task = true"
+            ))
+        except Exception:
+            pass
         # 清理上次进程遗留的僵尸任务：内存队列随重启清空，DB 中残留的 running/pending
         # 任务不会再被执行，标记为 failed，避免前端一直显示「进行中/排队中」。
         try:

@@ -76,3 +76,9 @@ async def health(cfg_id: int, user: User = Depends(get_current_user), session=De
 async def set_default(cfg_id: int, user: User = Depends(get_current_user), session=Depends(get_session)):
     """设为某类型默认模型（M9.3）。"""
     return success(await llm_service.set_default(session, user.id, cfg_id), "已设为默认")
+
+
+@router.post("/{cfg_id}/cancel-default")
+async def cancel_default(cfg_id: int, user: User = Depends(get_current_user), session=Depends(get_session)):
+    """取消某类型默认模型（M9.3）：该类型将无默认。"""
+    return success(await llm_service.cancel_default(session, user.id, cfg_id), "已取消默认")

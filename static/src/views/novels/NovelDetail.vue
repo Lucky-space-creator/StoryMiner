@@ -11,25 +11,33 @@
           <Tag v-for="t in (novel.tags || [])" :key="t" :label="t" />
         </div>
       </div>
-      <div class="flex gap-2 shrink-0 items-center">
+      <div class="flex gap-2 shrink-0 items-center flex-wrap">
         <input ref="docsEl" type="file" accept=".txt,.epub,.pdf,.docx" multiple class="hidden" @change="onFiles" />
-        <Button variant="secondary" :loading="uploading" @click="docsEl?.click()">上传文档</Button>
-        <Button @click="goKb">建知识库</Button>
+        <Button variant="secondary" :loading="uploading" title="上传 TXT/EPUB/PDF/DOCX，后台自动解析正文并生成 AI 概括" @click="docsEl?.click()">上传文档</Button>
+        <Button title="基于已上传文档构建可检索的知识库（含切片与向量）" @click="goKb">建知识库</Button>
         <!-- 分析模式：极速 / 深度思考 -->
-        <span class="flex items-center gap-1 text-xs text-muted ml-1">
+        <span class="flex items-center gap-1 text-xs text-muted ml-1" title="极速：快速抽取人物/章节，结果可在本页「人物档案 / 人物摘要 / 章节摘要」查看；深度：全量建库，进度在仪表盘查看">
           模式
-          <button type="button" @click="analysisMode = 'turbo'"
+          <button type="button" @click="analysisMode = 'turbo'" title="极速：快速抽取人物/章节，结果可在本页查看"
             :class="analysisMode === 'turbo' ? 'px-2 py-1 rounded bg-accent text-white' : 'px-2 py-1 rounded bg-surface2 text-muted'">极速</button>
-          <button type="button" @click="analysisMode = 'deep'"
+          <button type="button" @click="analysisMode = 'deep'" title="深度：全量建库与抽取，完成后到「人物档案」查看人物卡片"
             :class="analysisMode === 'deep' ? 'px-2 py-1 rounded bg-accent text-white' : 'px-2 py-1 rounded bg-surface2 text-muted'">深度</button>
         </span>
-        <Button variant="secondary" :loading="analyzing" @click="analyzeNovel">人物分析</Button>
-        <Button variant="ghost" size="sm" @click="viewSummary('character', '人物画像摘要')">人物摘要</Button>
-        <Button variant="secondary" :loading="chapterAnalyzing" @click="triggerChapterAnalysis">章节解析</Button>
-        <Button variant="ghost" size="sm" @click="viewSummary('chapter', '情节概览摘要')">章节摘要</Button>
-        <Button @click="goReadNovel">阅读小说</Button>
+        <Button variant="secondary" :loading="analyzing" title="基于整本小说抽取人物：生成「人物档案」卡片与「人物摘要」画像" @click="analyzeNovel">人物分析</Button>
+        <Button variant="ghost" size="sm" title="打开「人物档案」页，查看分析抽取出的人物卡片（身份、简介、出场次数）" @click="goCharacters">人物档案</Button>
+        <Button variant="ghost" size="sm" title="查看极速分析生成的「人物画像摘要」总览" @click="viewSummary('character', '人物画像摘要')">人物摘要</Button>
+        <Button variant="secondary" :loading="chapterAnalyzing" title="逐章分析情节、角色、伏笔等，完成后在本页「章节解析」区展示" @click="triggerChapterAnalysis">章节解析</Button>
+        <Button variant="ghost" size="sm" title="查看极速分析生成的「情节概览摘要」" @click="viewSummary('chapter', '情节概览摘要')">章节摘要</Button>
+        <Button title="打开阅读器：左侧选章节、右侧看正文，可召唤阅读助手对话" @click="goReadNovel">阅读小说</Button>
       </div>
     </div>
+
+    <!-- 操作指引：点击分析后明确告知结果位置与对应按钮 -->
+    <p class="text-xs text-muted">
+      操作指引：点「人物分析 / 章节解析」启动分析。
+      <template v-if="analysisMode === 'turbo'">极速模式下，人物结果可在本页「人物档案」「人物摘要」查看，章节结果在本页「章节摘要」与下方「章节解析」区查看。</template>
+      <template v-else>深度模式下，进度与结果可在仪表盘、知识库与「人物档案」页查看。</template>
+    </p>
 
     <p class="text-sm text-app">{{ novel.summary || '（暂无简介）' }}</p>
 
@@ -277,10 +285,20 @@ async function analyzeNovel() {
   analyzing.value = true
   try {
     const res = await analyzeCharacters(route.params.id, analysisMode.value)
+    const taskId = res.data?.task_id || '—'
+    const isLong = res.data?.is_long_task
     if (analysisMode.value === 'turbo') {
-      notify(`极速人物分析已启动（任务 #${res.data?.task_id || '—'}），完成后点「人物摘要」查看画像`, 'info')
+      if (isLong) {
+        notify(`任务 #${taskId} 预估耗时 ${res.data?.estimated_minutes || '?'} 分钟，已移至「长任务中心」（侧边栏可进入）。完成后到「人物档案」查看人物卡片`, 'info')
+      } else {
+        notify(`极速人物分析已启动（任务 #${taskId}）。完成后点本页「人物档案」查看人物卡片，或点「人物摘要」查看画像总览`, 'info')
+      }
     } else {
-      notify(`人物分析已启动（任务 #${res.data?.task_id || '—'}），可在仪表盘查看进度`, 'info')
+      if (isLong) {
+        notify(`人物分析已启动（任务 #${taskId}），预估耗时 ${res.data?.estimated_minutes || '?'} 分钟，已移至「长任务中心」。完成后到「人物档案」查看人物卡片`, 'info')
+      } else {
+        notify(`人物分析已启动（任务 #${taskId}），进度可在仪表盘查看；完成后到「人物档案」页查看人物卡片`, 'info')
+      }
     }
   } catch (e) {
     notify(e.message || '启动人物分析失败', 'error')
@@ -294,10 +312,20 @@ async function triggerChapterAnalysis() {
   chapterAnalyzing.value = true
   try {
     const res = await analyzeChapters(route.params.id, analysisMode.value)
+    const taskId = res.data?.task_id || '—'
+    const isLong = res.data?.is_long_task
     if (analysisMode.value === 'turbo') {
-      notify(`极速章节解析已启动（任务 #${res.data?.task_id || '—'}），完成后点「章节摘要」查看概览`, 'info')
+      if (isLong) {
+        notify(`任务 #${taskId} 预估耗时 ${res.data?.estimated_minutes || '?'} 分钟，已移至「长任务中心」。完成后点本页「章节摘要」查看概览`, 'info')
+      } else {
+        notify(`极速章节解析已启动（任务 #${taskId}）。完成后点「章节摘要」查看概览，本页「章节解析」区也会展示逐章结果`, 'info')
+      }
     } else {
-      notify(`章节解析已启动（任务 #${res.data?.task_id || '—'}），可在仪表盘查看进度`, 'info')
+      if (isLong) {
+        notify(`章节解析已启动（任务 #${taskId}），预估耗时 ${res.data?.estimated_minutes || '?'} 分钟，已移至「长任务中心」`, 'info')
+      } else {
+        notify(`章节解析已启动（任务 #${taskId}），进度可在仪表盘查看`, 'info')
+      }
     }
   } catch (e) {
     notify(e.message || '启动章节解析失败', 'error')
@@ -336,6 +364,11 @@ async function loadChapterAnalysis() {
 // 阅读小说：跳转到阅读页面
 function goReadNovel() {
   router.push({ path: `/novels/${route.params.id}/read` })
+}
+
+// 打开人物档案：跳转到该小说的人物卡片页（分析抽取结果在此查看）
+function goCharacters() {
+  router.push({ path: `/novels/${route.params.id}/characters` })
 }
 
 const analyzedCount = computed(() => {

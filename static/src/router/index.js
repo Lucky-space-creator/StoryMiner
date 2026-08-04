@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import Login from '@/views/auth/Login.vue'
 import Dashboard from '@/views/Dashboard.vue'
+import LongTaskCenter from '@/views/LongTaskCenter.vue'
 import NovelList from '@/views/novels/NovelList.vue'
 import NovelDetail from '@/views/novels/NovelDetail.vue'
 import NovelReader from '@/views/novels/NovelReader.vue'
@@ -22,6 +23,7 @@ const routes = [
   { path: '/register', name: 'register', component: Login, meta: { title: '注册', requiresAuth: false } },
   { path: '/', redirect: '/dashboard' },
   { path: '/dashboard', name: 'dashboard', component: Dashboard, meta: { title: '仪表盘', requiresAuth: true } },
+  { path: '/long-tasks', name: 'long-tasks', component: LongTaskCenter, meta: { title: '长任务中心', requiresAuth: true } },
   { path: '/novels', name: 'novels', component: NovelList, meta: { title: '小说', requiresAuth: true } },
   { path: '/novels/:id', name: 'novel-detail', component: NovelDetail, meta: { title: '小说详情', requiresAuth: true } },
   { path: '/novels/:id/read', name: 'novel-reader', component: NovelReader, meta: { title: '阅读小说', requiresAuth: true } },

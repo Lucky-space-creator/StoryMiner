@@ -25,6 +25,7 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 
 from common import crypto
+from common.exceptions import BizError
 from models.llm_config import LLMConfig
 
 logger = logging.getLogger(__name__)
@@ -45,13 +46,13 @@ def _build_openai(cfg: LLMConfig):
     kwargs = dict(
         model=cfg.model,
         api_key=api_key,
-        temperature=cfg.temperature or 0.7,
+        temperature=getattr(cfg, "temperature", 0.7) or 0.7,
         base_url=_norm_base_url(cfg.base_url) or None,
         timeout=CHAT_TIMEOUT,
         max_retries=2,
     )
-    if cfg.max_tokens:
-        kwargs["max_tokens"] = cfg.max_tokens
+    if getattr(cfg, "max_tokens", None):
+        kwargs["max_tokens"] = getattr(cfg, "max_tokens", None)
     return ChatOpenAI(**kwargs)
 
 
@@ -60,11 +61,11 @@ def _build_ollama(cfg: LLMConfig):
     kwargs = dict(
         model=cfg.model,
         base_url=_norm_base_url(cfg.base_url) or "http://localhost:11434",
-        temperature=cfg.temperature or 0.7,
+        temperature=getattr(cfg, "temperature", 0.7) or 0.7,
         timeout=CHAT_TIMEOUT,
     )
-    if cfg.max_tokens:
-        kwargs["num_predict"] = cfg.max_tokens
+    if getattr(cfg, "max_tokens", None):
+        kwargs["num_predict"] = getattr(cfg, "max_tokens", None)
     return ChatOllama(**kwargs)
 
 
@@ -113,6 +114,24 @@ def _extract_usage(message) -> dict | None:
     }
 
 
+def _friendly_llm_error(e: Exception) -> "BizError":
+    """将底层 LLM 调用异常翻译为可读业务错误。
+
+    典型根因：base_url 非 OpenAI 兼容端点（如缺 /v1 路径）时接口返回 HTML/纯文本，
+    被当成 str 响应后，langchain-openai 会触发 'str' object has no attribute 'model_dump'/'choices'。
+    """
+    msg = str(e)
+    if "has no attribute" in msg or "model_dump" in msg or "'str'" in msg or "Expecting value" in msg:
+        return BizError(
+            502,
+            "大模型调用失败：LLM 配置无效。请检查 API Key、base_url 是否为有效的 "
+            "OpenAI 兼容端点（通常需以 /v1 结尾），以及模型名称是否可用。",
+        )
+    if "Connection" in type(e).__name__ or "timeout" in msg.lower():
+        return BizError(502, f"大模型调用失败：无法连接服务，请检查 base_url 与网络。{msg}")
+    return BizError(502, f"大模型调用失败：{msg}")
+
+
 class LangChainAdapter:
     """LangChain 实现的大模型适配器，替代旧 services.llm_adapters。
 
@@ -126,36 +145,58 @@ class LangChainAdapter:
         self._embeddings = None
         self._last_usage = None
 
-    def _bind(self, **opts):
-        """把业务侧透传的采样参数（temperature/max_tokens/top_p/stop 等）绑定到模型。"""
+    def _bind(self, json_mode: bool = False, **opts):
+        """把业务侧透传的采样参数（temperature/max_tokens/top_p/stop 等）绑定到模型。
+
+        当 json_mode=True 时，按 provider 施加 JSON 输出约束：
+        ollama 走 bind(format="json")；其余（openai 兼容）走 response_format=json_object。
+        该约束对 7B 本地模型尤为关键——否则其常返回非 JSON 的乱码/散文。
+        """
         filtered = {
             k: v
             for k, v in opts.items()
             if k in ("temperature", "max_tokens", "top_p", "stop", "presence_penalty", "frequency_penalty")
             and v is not None
         }
-        if not filtered:
-            return self._model
-        # ollama 用 num_predict 表达 max_tokens，做兼容转换
-        if (self.cfg.provider or "").strip().lower() == "ollama" and "max_tokens" in filtered:
-            filtered["num_predict"] = filtered.pop("max_tokens")
-        return self._model.bind(**filtered)
+        provider = (self.cfg.provider or "").strip().lower()
+        model = self._model
+        if json_mode:
+            if provider == "ollama":
+                model = model.bind(format="json")
+            else:
+                model = model.bind(**{"response_format": {"type": "json_object"}})
+        if filtered:
+            # ollama 用 num_predict 表达 max_tokens，做兼容转换
+            if provider == "ollama" and "max_tokens" in filtered:
+                filtered["num_predict"] = filtered.pop("max_tokens")
+            model = model.bind(**filtered)
+        return model
 
-    async def chat(self, messages: list, **opts) -> str:
+    async def chat(self, messages: list, json_mode: bool = False, **opts) -> str:
         """单次对话调用，返回文本，并把用量写入 _last_usage。"""
-        resp = await self._bind(**opts).ainvoke(messages)
+        if self._model is None:
+            raise BizError(500, "模型未初始化（请检查 LLM 配置的 provider/model 是否受支持）")
+        try:
+            resp = await self._bind(json_mode=json_mode, **opts).ainvoke(messages)
+        except Exception as e:
+            raise _friendly_llm_error(e) from e
         self._last_usage = _extract_usage(resp)
         return _text_of(resp)
 
-    async def chat_stream(self, messages: list, **opts):
+    async def chat_stream(self, messages: list, json_mode: bool = False, **opts):
         """流式对话，逐块 yield 文本片段，并尽力捕获末块用量。"""
-        async for chunk in self._bind(**opts).astream(messages):
-            text = _text_of(chunk)
-            if text:
-                yield text
-            usage = _extract_usage(chunk)
-            if usage:
-                self._last_usage = usage
+        if self._model is None:
+            raise BizError(500, "模型未初始化（请检查 LLM 配置的 provider/model 是否受支持）")
+        try:
+            async for chunk in self._bind(json_mode=json_mode, **opts).astream(messages):
+                text = _text_of(chunk)
+                if text:
+                    yield text
+                usage = _extract_usage(chunk)
+                if usage:
+                    self._last_usage = usage
+        except Exception as e:
+            raise _friendly_llm_error(e) from e
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         """批量文本向量化，返回与输入同序的向量列表。"""

@@ -25,7 +25,7 @@ from config import ANALYSIS_MODE_DEFAULT
 from schemas.novel import NovelCreate, NovelUpdate, ChapterCorrect, ChapterSplit, ChapterMerge
 from services import (
     novel_service, parse_service, kb_service, chapter_analysis_service,
-    task_service, fast_analysis_service,
+    task_service, fast_analysis_service, task_estimation,
 )
 from repositories import novel_repo
 from models.analysis_summary import StoryAnalysisSummary
@@ -183,17 +183,26 @@ async def trigger_chapter_analysis(
     novel = await novel_repo.get_novel(session, user.id, novel_id)
     if not novel:
         raise BizError(404, "小说不存在")
-    # 创建异步任务
+    # V19：根据小说字数与处理模式预估任务耗时，区分长短任务
+    est = task_estimation.estimate_task_duration(novel.word_count or 0, mode)
     task = await task_service.create_task(
         session, user.id, type="chapter_analysis",
         name=f"章节解析·{novel.name}", novel_id=novel_id,
         extra={"mode": mode},
+        estimated_duration_minutes=est["estimated_minutes"],
+        is_long_task=est["is_long_task"],
+        estimated_complete_at=est["estimated_complete_at"],
     )
     if mode == "turbo":
         # 极速：单次/少量大上下文调用产出情节概览摘要
         task_queue.submit(
             fast_analysis_service.run_turbo, novel_id, user.id, "chapter", task.id)
-        return success({"task_id": task.id, "novel_id": novel_id, "mode": "turbo"}, "极速章节解析任务已启动")
+        return success({
+            "task_id": task.id, "novel_id": novel_id, "mode": "turbo",
+            "estimated_minutes": est["estimated_minutes"],
+            "is_long_task": est["is_long_task"],
+            "estimated_complete_at": est["estimated_complete_at"],
+        }, "极速章节解析任务已启动")
     # 提交后台任务（入全局串行队列，逐一执行；排队中前端显示「排队中」）
     task_queue.submit(
         chapter_analysis_service.analyze_chapters,
@@ -201,7 +210,12 @@ async def trigger_chapter_analysis(
         novel_name=novel.name, summary=novel.summary or "",
         async_task_id=task.id,
     )
-    return success({"task_id": task.id, "novel_id": novel_id, "mode": "deep"}, "章节解析任务已启动")
+    return success({
+        "task_id": task.id, "novel_id": novel_id, "mode": "deep",
+        "estimated_minutes": est["estimated_minutes"],
+        "is_long_task": est["is_long_task"],
+        "estimated_complete_at": est["estimated_complete_at"],
+    }, "章节解析任务已启动")
 
 
 @router.get("/{novel_id}/analysis-summary")

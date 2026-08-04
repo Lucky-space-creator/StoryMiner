@@ -129,21 +129,26 @@ async def get_task_overview(
     status: str | None = None, type: str | None = None,
     novel_name: str | None = None, completed: bool | None = None,
     page: int = 1, page_size: int = 20,
+    is_long_task: bool | None = False,
 ) -> dict:
     """异步任务进度总览（M14.1）：分页 + 条件查询任务列表 + 状态计数。
 
     关键点：
-        1. 任务列表走 query_tasks，支持状态/类型/是否完成/小说名模糊与分页。
-        2. summary 仍按该用户全部任务汇总（不受当前筛选影响），保持仪表盘概览稳定。
+        1. V19 默认 is_long_task=False，主面板仅展示短任务（≤10min 预估）。
+           长任务由独立"长任务中心"承载。
+        2. 任务列表走 query_tasks，支持状态/类型/是否完成/小说名模糊/长短任务筛选与分页。
+        3. summary 汇总默认仅统计短任务（与 is_long_task 参数一致）。
     """
     result = await task_service.query_tasks(
         session, owner_id, status=status, type=type,
-        novel_name=novel_name, completed=completed, page=page, page_size=page_size,
+        novel_name=novel_name, completed=completed, is_long_task=is_long_task,
+        page=page, page_size=page_size,
     )
-    # 汇总计数按全量任务（未筛选），与分页列表解耦
-    all_rows = (await session.execute(
-        select(AsyncTask).where(AsyncTask.owner_id == owner_id)
-    )).scalars().all()
+    # 汇总计数 — 默认与列表保持一致的 is_long_task 过滤
+    q = select(AsyncTask).where(AsyncTask.owner_id == owner_id)
+    if is_long_task is not None:
+        q = q.where(AsyncTask.is_long_task == is_long_task)
+    all_rows = (await session.execute(q)).scalars().all()
     summary = {
         "total": len(all_rows),
         "running": sum(1 for t in all_rows if t.status == "running"),

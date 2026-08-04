@@ -16,7 +16,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, String, Text, Integer, Boolean, DateTime, Numeric, func
+from sqlalchemy import BigInteger, String, Text, Integer, Boolean, DateTime, Numeric, Float, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -48,6 +48,9 @@ class LLMConfig(Base):
     extra: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # V18：采样参数（供 LangChain 适配器读取；缺失会导致阅读助手等调用抛 AttributeError）
+    temperature: Mapped[float] = mapped_column(Float, default=0.7, nullable=False)
+    max_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class LLMUsage(Base):

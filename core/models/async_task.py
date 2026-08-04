@@ -10,13 +10,15 @@
     2. stage/progress/status 对齐统一状态机：pending→running→success/failed。
     3. 关联字段按需填写（novel_id/kb_id/doc_id/target_id），extra 存回放/重试所需上下文。
     4. 表名严格为 story_async_task，owner_id 实现数据隔离。
+    5. V19：新增 estimated_duration_minutes / is_long_task / estimated_complete_at 字段，
+       支持长耗时任务差异化展示与独立管理。
 
 实现逻辑：
     声明式映射；JSONB 存 extra；时间字段带时区，服务端默认 now()。
 """
 from datetime import datetime
 
-from sqlalchemy import BigInteger, String, Text, Integer, DateTime, func
+from sqlalchemy import BigInteger, Boolean, String, Text, Integer, DateTime, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -45,5 +47,9 @@ class AsyncTask(Base):
     tokens_out: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # V19：长耗时任务差异化 — 预估耗时分钟数、是否长任务（>10分钟）、预计完成时刻
+    estimated_duration_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    is_long_task: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    estimated_complete_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     extra: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

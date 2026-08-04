@@ -16,11 +16,16 @@
             {{ value === 'active' ? '正常' : '异常' }}
           </span>
         </template>
+        <template #cell-is_default="{ value }">
+          <Tag v-if="value" label="默认" class="!text-accent" />
+          <span v-else class="text-muted">—</span>
+        </template>
         <template #cell-act="{ row }">
           <div class="flex gap-2">
             <Button variant="ghost" class="!py-1 !px-2" @click="health(row)">健康检查</Button>
             <Button variant="ghost" class="!py-1 !px-2" @click="openEdit(row)">编辑</Button>
             <Button v-if="!row.is_default" variant="ghost" class="!py-1 !px-2" @click="setDefault(row)">设为默认</Button>
+            <Button v-else variant="ghost" class="!py-1 !px-2 text-danger hover:text-danger" @click="cancelDefault(row)">取消默认</Button>
             <Button variant="ghost" class="!py-1 !px-2 text-danger hover:text-danger" @click="askDelete(row)">删除</Button>
           </div>
         </template>
@@ -88,7 +93,7 @@ import Tag from '@/components/ui/Tag.vue'
 import Modal from '@/components/ui/Modal.vue'
 import Input from '@/components/ui/Input.vue'
 import ConfirmDialog from '@/components/ui/ConfirmDialog.vue'
-import { listLlm, createLlm, updateLlm, healthLlm, setDefaultLlm, deleteLlm, usageLlm } from '@/api/llmConfigs'
+import { listLlm, createLlm, updateLlm, healthLlm, setDefaultLlm, cancelDefaultLlm, deleteLlm, usageLlm } from '@/api/llmConfigs'
 import { useToast } from '@/composables/useToast'
 
 const { notify } = useToast()
@@ -166,6 +171,12 @@ async function setDefault(row) {
   await setDefaultLlm(row.id)
   configs.value.forEach((c) => (c.is_default = c.id === row.id))
   notify(`已将「${row.name}」设为默认`, 'success')
+}
+
+async function cancelDefault(row) {
+  await cancelDefaultLlm(row.id)
+  configs.value.forEach((c) => (c.is_default = false))
+  notify(`已取消「${row.name}」的默认设置`, 'success')
 }
 
 async function save() {

@@ -71,7 +71,8 @@ import {
   PhBookOpen, PhSignOut, PhSun, PhMoon,
   PhGauge, PhBooks, PhDatabase, PhParagraph,
   PhGraph, PhUsers, PhPenNib,
-  PhCpu, PhPuzzlePiece, PhPlugs, PhFileText, PhCompass
+  PhCpu, PhPuzzlePiece, PhPlugs, PhFileText, PhCompass,
+  PhClock
 } from '@phosphor-icons/vue'
 import ProgressWindow from '@/components/ui/ProgressWindow.vue'
 
@@ -99,7 +100,10 @@ function logout() {
 }
 
 const nav = computed(() => [
-  { title: '工作台', items: [{ to: '/dashboard', label: '仪表盘', icon: PhGauge }] },
+  { title: '工作台', items: [
+    { to: '/dashboard', label: '仪表盘', icon: PhGauge },
+    { to: '/long-tasks', label: '长任务中心', icon: PhClock }
+  ] },
   {
     title: '内容',
     items: [

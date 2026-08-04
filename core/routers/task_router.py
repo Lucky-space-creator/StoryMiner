@@ -41,13 +41,15 @@ async def list_tasks(
     type: str | None = Query(None, description="parse/chunk/graph/character/chapter_analysis"),
     novel_name: str | None = Query(None, description="小说名模糊查询"),
     completed: bool | None = Query(None, description="是否完成：true=已结束, false=进行中"),
+    is_long_task: bool | None = Query(None, description="V19 筛选长/短任务：true=长任务，false=短任务"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
 ):
-    """任务列表（分页 + 条件查询：状态/类型/是否完成/小说名）。"""
+    """任务列表（分页 + 条件查询：状态/类型/是否完成/小说名/长短任务）。"""
     return success(await task_service.query_tasks(
         session, user.id, status=status, type=type,
-        novel_name=novel_name, completed=completed, page=page, page_size=page_size,
+        novel_name=novel_name, completed=completed, is_long_task=is_long_task,
+        page=page, page_size=page_size,
     ))
 
 
@@ -55,6 +57,25 @@ async def list_tasks(
 async def running(user: User = Depends(get_current_user), session=Depends(get_session)):
     """进行中任务列表（前端全局轮询）。"""
     return success(await task_service.list_running(session, user.id))
+
+
+@router.get("/long")
+async def long_tasks(
+    user: User = Depends(get_current_user),
+    session=Depends(get_session),
+    status: str | None = Query(None, description="running/success/failed/cancelled，不传=全部"),
+    type: str | None = Query(None, description="parse/chunk/graph/character"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+):
+    """V19 长任务中心：仅展示长任务（预估 >10分钟），显示预计完成时刻而非进度条。
+
+    前端长任务中心页面（LongTaskCenter）调用此接口，按状态筛选、分页加载。
+    """
+    return success(await task_service.query_tasks(
+        session, user.id, status=status, type=type, is_long_task=True,
+        page=page, page_size=page_size,
+    ))
 
 
 @router.get("/{task_id}")

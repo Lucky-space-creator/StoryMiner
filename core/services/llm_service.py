@@ -99,6 +99,18 @@ async def set_default(session: AsyncSession, owner_id: int, cfg_id: int) -> dict
     return config_out(cfg)
 
 
+async def cancel_default(session: AsyncSession, owner_id: int, cfg_id: int) -> dict:
+    """取消某类型的默认模型（M9.3）：清空同 owner+类型 的默认，使该类型无默认。"""
+    cfg = await llm_repo.get_owned(session, owner_id, cfg_id)
+    if not cfg:
+        raise BizError(404, "模型配置不存在")
+    await llm_repo.clear_default(session, owner_id, cfg.llm_type)
+    cfg.is_default = False
+    await session.commit()
+    await session.refresh(cfg)
+    return config_out(cfg)
+
+
 async def health(session: AsyncSession, owner_id: int, cfg_id: int) -> dict:
     """健康检查（M9.6）：连通+延迟，回写 status。"""
     cfg = await llm_repo.get_visible(session, owner_id, cfg_id)

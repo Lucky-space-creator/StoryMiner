@@ -59,12 +59,17 @@ async def tasks(
     type: str | None = Query(None, description="parse/chunk/graph/character"),
     novel_name: str | None = Query(None, description="小说名模糊查询"),
     completed: bool | None = Query(None, description="是否完成：true=已结束, false=进行中"),
+    is_long_task: bool | None = Query(False, description="V19 筛选长/短任务：默认false=短任务，true=长任务，None=全部"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
 ):
-    """异步任务进度总览（M14.1）：分页 + 条件查询（是否完成/小说名），任务列表 + 状态计数。"""
+    """异步任务进度总览（M14.1）：分页 + 条件查询，默认仅展示短任务（锁定主面板）。
+
+    V19：长任务不在此展示，统一在 /api/v1/tasks/long 独立管理中查看。
+    """
     data = await dashboard_service.get_task_overview(
         session, user.id, status=status, type=type, novel_name=novel_name,
         completed=completed, page=page, page_size=page_size,
+        is_long_task=is_long_task,
     )
     return success(data)

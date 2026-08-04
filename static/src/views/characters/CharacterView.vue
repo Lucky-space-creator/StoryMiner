@@ -52,12 +52,58 @@
 
     <Drawer v-model="openDetail" :title="current?.name || '人物'">
       <div v-if="current" class="space-y-4">
-        <div class="flex items-center gap-2">
-          <Tag :label="current.role" />
-          <span class="text-sm text-muted">出场 {{ current.appearances }} 次</span>
+        <!-- 内联 tab 切换：角色身份 / 角色形象 / 角色经历 / 关键事件 -->
+        <div class="flex border-b border-app/20 -mx-2 px-2">
+          <button v-for="t in tabs" :key="t.key" @click="tab = t.key"
+            :class="['px-3 py-2 text-sm transition border-b-2 -mb-[1px]',
+              tab === t.key ? 'border-accent text-accent font-medium' : 'border-transparent text-muted hover:text-app']">
+            {{ t.label }}
+          </button>
         </div>
-        <p class="text-sm text-app leading-relaxed">{{ current.desc }}</p>
-        <div class="flex justify-end gap-2">
+
+        <!-- 1. 角色身份 -->
+        <div v-if="tab === 'identity'" class="space-y-3">
+          <div class="flex flex-wrap items-center gap-2">
+            <Tag :label="current.role || '未知'" />
+            <span v-if="current.gender" class="px-2 py-0.5 bg-surface rounded border border-app/20 text-xs text-muted">{{ current.gender }}</span>
+            <span class="text-sm text-muted">出场 {{ current.appearances || 0 }} 次</span>
+          </div>
+          <div v-if="current.identity || current.personality" class="bg-surface rounded-lg p-3 space-y-2 border border-app/10">
+            <div v-if="current.identity" class="text-sm">
+              <span class="text-muted">身份：</span><span class="text-app">{{ current.identity }}</span>
+            </div>
+            <div v-if="current.personality" class="text-sm">
+              <span class="text-muted">性格：</span><span class="text-app">{{ current.personality }}</span>
+            </div>
+          </div>
+          <p v-if="current.catchphrase" class="text-sm text-app italic px-3">「{{ current.catchphrase }}」</p>
+          <p v-if="!current.identity && !current.personality && !current.catchphrase" class="text-sm text-muted italic">暂无更多身份信息</p>
+        </div>
+
+        <!-- 2. 角色形象 -->
+        <div v-else-if="tab === 'appearance'" class="space-y-3">
+          <p v-if="current.appearance" class="text-sm text-app leading-relaxed whitespace-pre-wrap">{{ current.appearance }}</p>
+          <p v-else class="text-sm text-muted italic">暂无外貌描述（书中未明确描绘或尚未分析）</p>
+        </div>
+
+        <!-- 3. 角色经历 -->
+        <div v-else-if="tab === 'experience'" class="space-y-3">
+          <p v-if="current.desc" class="text-sm text-app leading-relaxed whitespace-pre-wrap">{{ current.desc }}</p>
+          <p v-else class="text-sm text-muted italic">暂无经历记录，可点击下方「AI 生成小传」</p>
+        </div>
+
+        <!-- 4. 关键事件 -->
+        <div v-else-if="tab === 'events'" class="space-y-3">
+          <template v-if="current.key_events?.length">
+            <div v-for="(ev, i) in current.key_events" :key="i" class="bg-surface rounded-lg p-3 border border-app/10">
+              <p class="text-sm text-app leading-relaxed">{{ ev.event }}</p>
+              <p class="text-xs text-muted mt-1">{{ ev.chapters }}</p>
+            </div>
+          </template>
+          <p v-else class="text-sm text-muted italic">暂无关键事件记录，重新执行人物分析后可自动提取</p>
+        </div>
+
+        <div class="flex justify-end gap-2 pt-2 border-t border-app/10">
           <Button variant="ghost" @click="generate">AI 生成小传</Button>
           <Button @click="openDetail = false">关闭</Button>
         </div>
@@ -120,6 +166,15 @@ const delOpen = ref(false)
 const pending = ref(null)
 const myTaskId = ref(null)
 
+// 人物详情抽屉 4 区块 tab
+const tab = ref('identity')
+const tabs = [
+  { key: 'identity', label: '角色身份' },
+  { key: 'appearance', label: '角色形象' },
+  { key: 'experience', label: '角色经历' },
+  { key: 'events', label: '关键事件' },
+]
+
 onMounted(async () => {
   const res = await listNovels()
   novels.value = res.data?.list || []
@@ -138,6 +193,7 @@ async function load() {
 async function open(c) {
   const res = await getCharacter(c.id)
   current.value = res.data || c
+  tab.value = 'identity'
   openDetail.value = true
 }
 

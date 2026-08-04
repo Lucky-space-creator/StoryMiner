@@ -46,13 +46,15 @@ def _to_list_item(c: Character) -> dict:
 
 
 def _to_detail(c: Character) -> dict:
-    """详情：返回完整档案。"""
+    """详情：返回完整档案，含关键事件（key_events，从 extra JSONB 提取）。"""
+    extra = c.extra or {}
     return {
         "id": c.id, "name": c.name, "role": c.role, "gender": c.gender,
         "identity": c.identity, "personality": c.personality,
         "appearance": c.appearance, "catchphrase": c.catchphrase,
         "desc": c.description, "avatar": c.avatar, "source": c.source,
         "appearances": c.appearances,
+        "key_events": extra.get("key_events", []),
     }
 
 

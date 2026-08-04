@@ -26,6 +26,8 @@ class LLMConfigCreate(BaseModel):
     weight: int = 0
     timeout: int = 60
     extra: dict = {}
+    temperature: float = 0.7
+    max_tokens: int | None = None
 
 
 class LLMConfigUpdate(BaseModel):
@@ -40,6 +42,8 @@ class LLMConfigUpdate(BaseModel):
     timeout: int | None = None
     status: str | None = None
     extra: dict | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
 
 
 class LLMConfigOut(BaseModel):
@@ -57,6 +61,8 @@ class LLMConfigOut(BaseModel):
     timeout: int
     status: str
     extra: dict = {}
+    temperature: float = 0.7
+    max_tokens: int | None = None
     created_at: str | None = None
     updated_at: str | None = None
 

@@ -15,17 +15,21 @@
 </template>
 
 <script setup>
-import { ref, reactive } from 'vue'
-import { useRouter } from 'vue-router'
+import { ref, reactive, watch } from 'vue'
+import { useRouter, useRoute } from 'vue-router'
 import { useUserStore } from '@/stores/user'
 import { useToast } from '@/composables/useToast'
 import Input from '@/components/ui/Input.vue'
 import Button from '@/components/ui/Button.vue'
 
 const router = useRouter()
+const route = useRoute()
 const user = useUserStore()
 const { notify } = useToast()
-const isRegister = ref(false)
+// 注册/登录模式由当前路由决定：/register 进入注册模式，/login 进入登录模式；
+// 同时保留「去注册/去登录」手动切换能力（watch 路由变化同步模式）。
+const isRegister = ref(route.name === 'register')
+watch(() => route.name, (name) => { isRegister.value = name === 'register' })
 const loading = ref(false)
 const form = reactive({ username: '', password: '', name: '' })
 

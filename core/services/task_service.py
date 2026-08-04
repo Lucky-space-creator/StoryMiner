@@ -27,12 +27,30 @@ async def create_task(
     novel_id: int | None = None, kb_id: int | None = None,
     doc_id: int | None = None, target_id: int | None = None,
     extra: dict | None = None,
+    estimated_duration_minutes: int | None = None,
+    is_long_task: bool = False,
+    estimated_complete_at: str | None = None,
 ) -> AsyncTask:
-    """创建一条异步任务（请求会话内提交）。"""
+    """
+    创建一条异步任务（请求会话内提交）。
+
+    V19：支持长耗时任务预估参数，新任务默认写入 is_long_task / estimated_duration_minutes
+    / estimated_complete_at 字段，供前端差异化展示（Dashboard 短任务 / 长任务中心）。
+    """
+    from datetime import datetime as dt
+    etc = None
+    if estimated_complete_at:
+        try:
+            etc = dt.fromisoformat(estimated_complete_at)
+        except (ValueError, TypeError):
+            etc = None
     t = AsyncTask(
         owner_id=owner_id, type=type, name=name,
         novel_id=novel_id, kb_id=kb_id, doc_id=doc_id, target_id=target_id,
         extra=extra or {}, status="running", stage="pending",
+        estimated_duration_minutes=estimated_duration_minutes,
+        is_long_task=is_long_task,
+        estimated_complete_at=etc,
     )
     session.add(t)
     await session.commit()
@@ -102,6 +120,7 @@ async def query_tasks(
     session: AsyncSession, owner_id: int,
     status: str | None = None, type: str | None = None,
     novel_name: str | None = None, completed: bool | None = None,
+    is_long_task: bool | None = None,
     page: int = 1, page_size: int = 20,
 ) -> dict:
     """分页 + 条件查询统一异步任务（按 owner 隔离）。
@@ -111,6 +130,7 @@ async def query_tasks(
         2. type 精确匹配（parse/chunk/graph/character）。
         3. completed 布尔：True=已结束(非 running)，False=进行中。
         4. novel_name 小说名模糊匹配（ILIKE %kw%），按 novel_id 关联 story_novel。
+        5. V19 is_long_task 布尔：True=长任务，False=短任务，None=不过滤。
     返回 {items, total, page, page_size}，供仪表盘与前端分页展示。
     """
     from models.novel_content import Novel
@@ -123,6 +143,8 @@ async def query_tasks(
         base = base.where(AsyncTask.status != "running" if completed else AsyncTask.status == "running")
     if novel_name:
         base = base.join(Novel, Novel.id == AsyncTask.novel_id).where(Novel.name.ilike(f"%{novel_name}%"))
+    if is_long_task is not None:
+        base = base.where(AsyncTask.is_long_task == is_long_task)
     total = (await session.execute(base.with_only_columns(func.count()))).scalar() or 0
     page = max(1, int(page))
     page_size = max(1, min(int(page_size), 200))
@@ -133,7 +155,7 @@ async def query_tasks(
 
 
 def _out(t: AsyncTask) -> dict:
-    """任务出参：统一结构，前端直接消费。"""
+    """任务出参：统一结构，前端直接消费。V19 新增预估耗时、长任务标记、预计完成时刻。"""
     return {
         "id": t.id, "type": t.type, "name": t.name,
         "novel_id": t.novel_id, "kb_id": t.kb_id,
@@ -144,6 +166,9 @@ def _out(t: AsyncTask) -> dict:
         "started_at": t.started_at.isoformat() if t.started_at else None,
         "finished_at": t.finished_at.isoformat() if t.finished_at else None,
         "created_at": t.created_at.isoformat() if t.created_at else None,
+        "estimated_duration_minutes": t.estimated_duration_minutes,
+        "is_long_task": t.is_long_task if hasattr(t, 'is_long_task') else False,
+        "estimated_complete_at": t.estimated_complete_at.isoformat() if t.estimated_complete_at else None,
         "extra": t.extra or {},
     }
 
