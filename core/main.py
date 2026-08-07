@@ -30,10 +30,10 @@ from routers import parse_tasks as parse_tasks_router
 from routers import knowledge_bases as kb_router
 from routers import documents as documents_router
 from routers import llm_configs as llm_configs_router
-from routers import prompt_templates as prompt_templates_router
 from routers import chunks as chunks_router
 from routers import graph as graph_router
 from routers import characters as characters_router
+from routers import chapter_dramas as chapter_dramas_router
 from routers import writing as writing_router
 from routers import ws_write as ws_write_router
 from routers import ws_reading_chat as ws_reading_chat_router
@@ -207,13 +207,13 @@ app.include_router(parse_tasks_router.router, prefix="/api/v1")
 app.include_router(kb_router.router, prefix="/api/v1")
 app.include_router(documents_router.router, prefix="/api/v1")
 app.include_router(llm_configs_router.router, prefix="/api/v1")
-app.include_router(prompt_templates_router.router, prefix="/api/v1")
 app.include_router(chunks_router.router, prefix="/api/v1")
 app.include_router(graph_router.router, prefix="/api/v1")
 app.include_router(graph_router.rt_router, prefix="/api/v1")
 app.include_router(graph_router.et_router, prefix="/api/v1")
 app.include_router(characters_router.novel_router, prefix="/api/v1")
 app.include_router(characters_router.char_router, prefix="/api/v1")
+app.include_router(chapter_dramas_router.router, prefix="/api/v1")
 app.include_router(writing_router.router, prefix="/api/v1")
 app.include_router(ws_write_router.ws_router)
 app.include_router(ws_reading_chat_router.ws_router)

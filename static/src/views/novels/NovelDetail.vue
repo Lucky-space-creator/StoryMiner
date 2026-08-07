@@ -20,7 +20,7 @@
           模式
           <button type="button" @click="analysisMode = 'turbo'" title="极速：快速抽取人物/章节，结果可在本页查看"
             :class="analysisMode === 'turbo' ? 'px-2 py-1 rounded bg-accent text-white' : 'px-2 py-1 rounded bg-surface2 text-muted'">极速</button>
-          <button type="button" @click="analysisMode = 'deep'" title="深度：全量建库与抽取，完成后到「人物档案」查看人物卡片"
+          <button type="button" @click="analysisMode = 'deep'" title="深度：全量建库与抽取，任务提交后到「长任务中心」查看进度，完成后到「人物档案」查看结果"
             :class="analysisMode === 'deep' ? 'px-2 py-1 rounded bg-accent text-white' : 'px-2 py-1 rounded bg-surface2 text-muted'">深度</button>
         </span>
         <Button variant="secondary" :loading="analyzing" title="基于整本小说抽取人物：生成「人物档案」卡片与「人物摘要」画像" @click="analyzeNovel">人物分析</Button>
@@ -29,6 +29,7 @@
         <Button variant="secondary" :loading="chapterAnalyzing" title="逐章分析情节、角色、伏笔等，完成后在本页「章节解析」区展示" @click="triggerChapterAnalysis">章节解析</Button>
         <Button variant="ghost" size="sm" title="查看极速分析生成的「情节概览摘要」" @click="viewSummary('chapter', '情节概览摘要')">章节摘要</Button>
         <Button title="打开阅读器：左侧选章节、右侧看正文，可召唤阅读助手对话" @click="goReadNovel">阅读小说</Button>
+        <Button variant="secondary" title="为该小说选定连续章节生成漫剧素材（章节漫剧列）" @click="goChapterDramas">章节漫剧</Button>
       </div>
     </div>
 
@@ -36,7 +37,7 @@
     <p class="text-xs text-muted">
       操作指引：点「人物分析 / 章节解析」启动分析。
       <template v-if="analysisMode === 'turbo'">极速模式下，人物结果可在本页「人物档案」「人物摘要」查看，章节结果在本页「章节摘要」与下方「章节解析」区查看。</template>
-      <template v-else>深度模式下，进度与结果可在仪表盘、知识库与「人物档案」页查看。</template>
+      <template v-else>深度模式下，任务自动进入「长任务中心」（侧边栏可进入），完成后在「人物档案」页和「知识库」页查看结果。</template>
     </p>
 
     <p class="text-sm text-app">{{ novel.summary || '（暂无简介）' }}</p>
@@ -294,11 +295,8 @@ async function analyzeNovel() {
         notify(`极速人物分析已启动（任务 #${taskId}）。完成后点本页「人物档案」查看人物卡片，或点「人物摘要」查看画像总览`, 'info')
       }
     } else {
-      if (isLong) {
-        notify(`人物分析已启动（任务 #${taskId}），预估耗时 ${res.data?.estimated_minutes || '?'} 分钟，已移至「长任务中心」。完成后到「人物档案」查看人物卡片`, 'info')
-      } else {
-        notify(`人物分析已启动（任务 #${taskId}），进度可在仪表盘查看；完成后到「人物档案」页查看人物卡片`, 'info')
-      }
+      // 深度模式：统一走长任务中心
+      notify(`深度人物分析已启动（任务 #${taskId}），预估耗时 ${res.data?.estimated_minutes || '?'} 分钟，请前往「长任务中心」（侧边栏可进入）查看进度。完成后到「人物档案」页查看人物卡片`, 'info', 6000)
     }
   } catch (e) {
     notify(e.message || '启动人物分析失败', 'error')
@@ -321,11 +319,8 @@ async function triggerChapterAnalysis() {
         notify(`极速章节解析已启动（任务 #${taskId}）。完成后点「章节摘要」查看概览，本页「章节解析」区也会展示逐章结果`, 'info')
       }
     } else {
-      if (isLong) {
-        notify(`章节解析已启动（任务 #${taskId}），预估耗时 ${res.data?.estimated_minutes || '?'} 分钟，已移至「长任务中心」`, 'info')
-      } else {
-        notify(`章节解析已启动（任务 #${taskId}），进度可在仪表盘查看`, 'info')
-      }
+      // 深度模式：统一走长任务中心
+      notify(`深度章节解析已启动（任务 #${taskId}），预估耗时 ${res.data?.estimated_minutes || '?'} 分钟，请前往「长任务中心」（侧边栏可进入）查看进度`, 'info', 6000)
     }
   } catch (e) {
     notify(e.message || '启动章节解析失败', 'error')
@@ -369,6 +364,11 @@ function goReadNovel() {
 // 打开人物档案：跳转到该小说的人物卡片页（分析抽取结果在此查看）
 function goCharacters() {
   router.push({ path: `/novels/${route.params.id}/characters` })
+}
+
+// 打开章节漫剧：先在本页选定小说，再进入该小说的章节漫剧列
+function goChapterDramas() {
+  router.push({ path: `/novels/${route.params.id}/chapter-dramas` })
 }
 
 const analyzedCount = computed(() => {

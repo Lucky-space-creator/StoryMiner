@@ -421,17 +421,15 @@ def _build_chapters_block(batch, novel_name: str, summary: str, total: int, chap
     return "\n\n".join(blocks)
 
 
-async def _acall_llm(messages, *, owner_id: int, task_type: str, config_id: int, cfg):
-    """经 LangChain 调用层发起 LLM 调用（M4）。
-
-    返回 (文本, usage)；usage 已由 invoke_with_usage 写入 story_llm_usage，故返回 None。
+async def _acall_llm(messages, *, cfg):
+    """经 LangChain 调用层发起 LLM 调用，返回 (文本, usage_dict)。
+    usage 由调用方累积，任务结束时由 update_task_progress 统一写入，不逐次写 DB。
     """
     from llm.langchain_factory import get_langchain_model, invoke_with_usage
     model = get_langchain_model(cfg)
-    resp = await invoke_with_usage(
-        model, messages, owner_id=owner_id, task_type=task_type, config_id=config_id)
+    resp, usage = await invoke_with_usage(model, messages)
     content = getattr(resp, "content", None)
-    return (content if isinstance(content, str) else str(resp), None)
+    return (content if isinstance(content, str) else str(resp), usage)
 
 
 async def _analyze_chapter_batch(batch, novel_name, summary, total, chapters_full,
@@ -458,9 +456,7 @@ async def _analyze_chapter_batch(batch, novel_name, summary, total, chapters_ful
     if task_id:
         await task_service.update_task_progress(task_id, stage="analyzing", progress=lo, status="running")
 
-    text, usage = await _acall_llm(
-        messages, owner_id=owner_id, task_type="chapter_analysis",
-        config_id=config_id, cfg=cfg)
+    text, usage = await _acall_llm(messages, cfg=cfg)
     if usage:
         tok_in += usage.get("tokens_in", 0)
         tok_out += usage.get("tokens_out", 0)
@@ -509,6 +505,7 @@ async def analyze_chapters(
     async with SessionLocal() as session:
         tok_in_total = 0
         tok_out_total = 0
+        usage_info = None  # try 内获取 adapter 后赋值，except 中回退使用
         try:
             if async_task_id:
                 await task_service.update_task_progress(
@@ -522,6 +519,8 @@ async def analyze_chapters(
                 raise BizError(400, "该小说暂无章节，请先上传并解析文档")
 
             adapter, cfg, model_name, config_id = await _get_chat_adapter(session, owner_id)
+            # 终态统一写入时需要的上下文，提前赋值确保 except 中可用
+            usage_info = {"config_id": config_id, "model": model_name, "task_type": "chapter_analysis"}
 
             # ---- Phase 1: 结构分析 ----
             if async_task_id:
@@ -636,18 +635,7 @@ async def analyze_chapters(
 
             await session.commit()
 
-            # 记录 token（用量记录失败不影响主流程）
-            if tok_in_total or tok_out_total:
-                try:
-                    await task_service.record_llm_usage(
-                        owner_id=owner_id, config_id=config_id, model=model_name,
-                        task_type="chapter_analysis", tokens_in=tok_in_total, tokens_out=tok_out_total,
-                    )
-                except Exception:
-                    pass
-                if async_task_id:
-                    await task_service.update_task_progress(
-                        async_task_id, tokens_in=tok_in_total, tokens_out=tok_out_total)
+            # token 用量由 update_task_progress 终态统一写入 story_llm_usage，不再逐次写入
 
             if async_task_id:
                 skipped_info = f"，跳过{len(skip_nos)}章非正文" if skip_nos else ""
@@ -655,6 +643,7 @@ async def analyze_chapters(
                     async_task_id, stage="done", progress=100, status="success",
                     message=f"已完成 {analyzed} 章分析，{failed} 章失败{skipped_info}",
                     finished_at=datetime.now(timezone.utc),
+                    tokens_in=tok_in_total, tokens_out=tok_out_total, usage_info=usage_info,
                     extra={"structure": structure, "analyzed": analyzed, "failed": failed,
                            "total": total, "skipped": len(skip_nos)},
                 )
@@ -674,11 +663,13 @@ async def analyze_chapters(
                         async_task_id, stage="cancelled", status="cancelled",
                         error=e.reason, finished_at=datetime.now(timezone.utc),
                         tokens_in=e.tokens_in, tokens_out=e.tokens_out,
+                        usage_info=usage_info,
                     )
                     return {"analyzed": 0, "failed": 0, "total": len(chapters) if 'chapters' in dir() else 0, "cancelled": True}
                 await task_service.update_task_progress(
                     async_task_id, stage="failed", status="failed",
                     error=to_user_error(e), finished_at=datetime.now(timezone.utc),
+                    tokens_in=tok_in_total, tokens_out=tok_out_total, usage_info=usage_info,
                 )
             raise
 

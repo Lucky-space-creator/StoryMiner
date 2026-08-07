@@ -148,7 +148,6 @@ CREATE TABLE IF NOT EXISTS story_entity (
     profile     JSONB        NOT NULL DEFAULT '{}',         -- 性别/身份/性格/外貌/口头禅
     description TEXT,
     avatar      VARCHAR(512),                               -- MinIO object_key
-    prompt_tpl_id BIGINT,                                   -- 绑定 persona 模板(V2)
     extra       JSONB        NOT NULL DEFAULT '{}',
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),

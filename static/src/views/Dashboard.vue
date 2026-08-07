@@ -128,7 +128,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import * as echarts from 'echarts'
 import Card from '@/components/ui/Card.vue'
 import Drawer from '@/components/ui/Drawer.vue'
@@ -136,7 +136,7 @@ import Button from '@/components/ui/Button.vue'
 import { getStats, getTokenUsage, getTokenTrend, getModelStats, getTaskOverview } from '@/api/dashboard'
 import { retryParseTask } from '@/api/parseTasks'
 import { cancelTask } from '@/api/tasks'
-import { typeText } from '@/utils/taskStages'
+import { typeText, stageText, statusText } from '@/utils/taskStages'
 
 const statCards = ref([])
 const usage = ref({ tokensIn: 0, tokensOut: 0, calls: 0, cost: 0 })
@@ -222,15 +222,8 @@ async function onRetry(taskId) {
   }
 }
 
-const STAGE_LABEL = {
-  pending: '排队中', preparing: '准备中', parsing: '解析中', splitting: '切章中',
-  chunking: '切分文档', embedding: '向量化中', storing: '写入索引',
-  extracting: '抽取实体中', generating: '生成小传中', done: '已完成', failed: '失败',
-  cancelled: '已取消',
-}
-const STATUS_LABEL = { running: '进行中', success: '成功', failed: '失败', cancelled: '已取消' }
-function stageLabel(s) { return STAGE_LABEL[s] || s || '未知' }
-function statusLabel(s) { return STATUS_LABEL[s] || s || '未知' }
+function stageLabel(s) { return stageText(s) || s || '未知' }
+function statusLabel(s) { return statusText(s) || s || '未知' }
 function statusClass(s) {
   if (s === 'success') return 'text-emerald-600'
   if (s === 'failed') return 'text-red-600'
@@ -246,28 +239,72 @@ function fmt(iso) {
 
 function renderTrend(data) {
   if (!trendEl.value) return
+  // 先释放旧实例，避免 HMR/重复挂载时 echarts 报错
+  if (trendChart) {
+    trendChart.dispose()
+    trendChart = null
+  }
   trendChart = echarts.init(trendEl.value)
+  const safe = Array.isArray(data) ? data : []
   trendChart.setOption({
-    grid: { left: 40, right: 16, top: 16, bottom: 28 },
-    xAxis: { type: 'category', data: data.map((d) => d.date), axisLine: { lineStyle: { color: '#78716c' } } },
-    yAxis: { type: 'value', splitLine: { lineStyle: { color: '#e7e5e4' } } },
-    series: [{ type: 'line', smooth: true, data: data.map((d) => d.tokens), itemStyle: { color: '#0d9488' }, areaStyle: { color: 'rgba(13,148,136,0.12)' } }]
-  })
+    tooltip: {
+      trigger: 'axis',
+      formatter: (params) => {
+        const p = params?.[0]
+        return p ? `${p.name}<br/>Token: ${Number(p.value).toLocaleString()}` : ''
+      }
+    },
+    grid: { left: 72, right: 24, top: 24, bottom: 28 },
+    xAxis: {
+      type: 'category',
+      data: safe.map((d) => d.date),
+      axisLine: { lineStyle: { color: '#78716c' } },
+      axisLabel: { color: '#78716c' }
+    },
+    yAxis: {
+      type: 'value',
+      splitLine: { lineStyle: { color: '#e7e5e4' } },
+      axisLabel: {
+        color: '#78716c',
+        formatter: (v) => v >= 10000 ? (v / 10000).toFixed(1) + '万' : String(Math.round(v))
+      }
+    },
+    series: [{
+      type: 'line',
+      smooth: true,
+      data: safe.map((d) => d.tokens),
+      itemStyle: { color: '#0d9488' },
+      areaStyle: { color: 'rgba(13,148,136,0.12)' },
+      showSymbol: false
+    }]
+  }, true)
+  // DOM 布局稳定后重算尺寸，防止容器宽度为 0 时初始化失败
+  nextTick(() => trendChart?.resize())
 }
 
 function renderModel(data) {
   if (!modelEl.value) return
+  if (modelChart) {
+    modelChart.dispose()
+    modelChart = null
+  }
   modelChart = echarts.init(modelEl.value)
+  const safe = Array.isArray(data) ? data : []
   modelChart.setOption({
-    tooltip: { trigger: 'item' },
+    tooltip: {
+      trigger: 'item',
+      formatter: '{b}: {c} 次 ({d}%)'
+    },
     legend: { bottom: 0, textStyle: { color: '#78716c' } },
     series: [{
       type: 'pie',
       radius: ['45%', '70%'],
-      data: data.map((d) => ({ name: d.name, value: d.calls })),
-      color: ['#0d9488', '#2dd4bf', '#d97706', '#dc2626']
+      data: safe.map((d) => ({ name: d.name, value: d.calls })),
+      color: ['#0d9488', '#2dd4bf', '#d97706', '#dc2626'],
+      label: { color: '#78716c' }
     }]
-  })
+  }, true)
+  nextTick(() => modelChart?.resize())
 }
 
 function resize() {

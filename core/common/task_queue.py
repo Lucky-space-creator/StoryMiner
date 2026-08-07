@@ -68,13 +68,23 @@ def submit(func, *args, **kwargs) -> None:
 
 
 async def _worker() -> None:
-    """常驻 worker：逐一取出任务并顺序执行，单任务异常不影响后续。"""
+    """常驻 worker：逐一取出任务并顺序执行，单任务异常不影响后续。
+
+    V20 加固：单任务整体加硬超时（默认 30min），避免任意环节（LLM 挂起/死循环）
+    永久阻塞唯一 worker 导致后续任务全部饿死在 pending。超时任务被取消并记日志，
+    队列继续处理后续任务。
+    """
     q = _get_queue()
-    logger.info("串行任务队列 worker 已启动")
+    # 单任务最大执行时长：默认 30 分钟，可用环境变量 TASK_HARD_TIMEOUT 覆盖
+    import os as _os
+    _hard = float(_os.getenv("TASK_HARD_TIMEOUT", "1800"))
+    logger.info("串行任务队列 worker 已启动（单任务硬超时 %.0fs）", _hard)
     while True:
         func, args, kwargs = await q.get()
         try:
-            await func(*args, **kwargs)
+            await asyncio.wait_for(func(*args, **kwargs), timeout=_hard)
+        except asyncio.TimeoutError:
+            logger.error("串行任务执行超时(>%.0fs)被取消: %s", _hard, _func_path(func))
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001

@@ -35,6 +35,8 @@ class CharacterState(TypedDict, total=False):
     results: list
     created: int
     skipped: int
+    tok_in: int
+    tok_out: int
 
 
 def _parse_json(raw: str) -> dict | list:
@@ -53,17 +55,15 @@ def _parse_json(raw: str) -> dict | list:
         return {}
 
 
-async def _acall(messages, *, owner_id: int, task_type: str, config_id: int, cfg):
+async def _acall(messages, *, cfg):
     """经 LangChain 调用层发起人物精析 LLM 调用（M7 复用 M1）。
-
-    返回 (文本, usage)；usage 已由 invoke_with_usage 写入 story_llm_usage，故返回 None。
+    返回 (文本, usage_dict)。usage 由调用方累积，任务结束时统一写入 DB。
     """
     from llm.langchain_factory import get_langchain_model, invoke_with_usage
     model = get_langchain_model(cfg)
-    resp = await invoke_with_usage(
-        model, messages, owner_id=owner_id, task_type=task_type, config_id=config_id)
+    resp, usage = await invoke_with_usage(model, messages)
     content = getattr(resp, "content", None)
-    return (content if isinstance(content, str) else str(resp), None)
+    return (content if isinstance(content, str) else str(resp), usage)
 
 
 _CANDIDATE_PROMPT = """你是小说人物小传撰写助手。请为【指定人物】生成结构化档案。
@@ -110,9 +110,10 @@ async def _analyze_node(state: CharacterState, config) -> CharacterState:
         freq = c.get("freq", 0)
         ctx = _extract_context(state["full_text"], name)
         prompt = _CANDIDATE_PROMPT.replace("{name}", name).replace("{text}", ctx)
-        text, _usage = await _acall(
-            [{"role": "user", "content": prompt}], owner_id=owner_id,
-            task_type="character_analysis", config_id=config_id, cfg=cfg)
+        text, usage = await _acall([{"role": "user", "content": prompt}], cfg=cfg)
+        if usage:
+            state["tok_in"] = state.get("tok_in", 0) + usage.get("tokens_in", 0)
+            state["tok_out"] = state.get("tok_out", 0) + usage.get("tokens_out", 0)
         data = _parse_json(text)
         item = data[0] if isinstance(data, list) else data
         if isinstance(item, dict) and item.get("name"):

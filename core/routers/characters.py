@@ -48,6 +48,12 @@ class CharacterUpdate(BaseModel):
     avatar: str | None = None
 
 
+class AnalyzeChapters(BaseModel):
+    """按选定章节分析人物（M6.8）：指定章节范围，仅对该部分正文抽取人物并入库。"""
+    chapter_ids: list[int] | None = None
+    mode: str = "deep"
+
+
 @novel_router.get("/{novel_id}/characters")
 async def list_characters(
     novel_id: int,
@@ -136,47 +142,81 @@ async def analyze_characters(
 
     后台异步执行，立即返回统一 task_id 供仪表盘轮询进度。
     mode=turbo：极速摘要（大上下文少调用，秒~分钟出人物画像）；mode=deep：深度全量建库。
+    deep 模式统一标记为长任务，前端直接指引到「长任务中心」查看进度。
     """
-    import traceback
-    try:
-        novel = await novel_repo.get_novel(session, user.id, novel_id)
-        if not novel:
-            raise BizError(404, "小说不存在")
-        # V19：根据小说字数与处理模式预估任务耗时，区分长短任务
-        # Novel 模型无 word_count 字段，从 extra 中获取或默认 0
-        _wc = (novel.extra or {}).get("word_count", 0) if novel.extra else 0
-        est = task_estimation.estimate_task_duration(_wc, mode)
-        task = await task_service.create_task(
-            session, user.id, "character_analysis",
-            f"小说{novel.name}-人物分析", novel_id=novel_id,
-            extra={"mode": mode},
-            estimated_duration_minutes=est["estimated_minutes"],
-            is_long_task=est["is_long_task"],
-            estimated_complete_at=est["estimated_complete_at"],
-        )
-        if mode == "turbo":
-            # 极速：少量大上下文调用，抽取结构化人物并写入「人物档案」，同时留存摘要
-            task_queue.submit(
-                fast_analysis_service.run_turbo, novel_id, user.id, "character", task.id)
-            return success({
-                "task_id": task.id, "mode": "turbo",
-                "estimated_minutes": est["estimated_minutes"],
-                "is_long_task": est["is_long_task"],
-                "estimated_complete_at": est["estimated_complete_at"],
-            }, "已启动极速人物分析")
+    novel = await novel_repo.get_novel(session, user.id, novel_id)
+    if not novel:
+        raise BizError(404, "小说不存在")
+    # V19：根据小说字数与处理模式预估任务耗时，区分长短任务
+    # Novel 模型无 word_count 字段，从 extra 中获取或默认 0
+    _wc = (novel.extra or {}).get("word_count", 0) if novel.extra else 0
+    est = task_estimation.estimate_task_duration(_wc, mode)
+    task = await task_service.create_task(
+        session, user.id, "character_analysis",
+        f"小说{novel.name}-人物分析", novel_id=novel_id,
+        extra={"mode": mode},
+        estimated_duration_minutes=est["estimated_minutes"],
+        is_long_task=est["is_long_task"],
+        estimated_complete_at=est["estimated_complete_at"],
+    )
+    if mode == "turbo":
+        # 极速：少量大上下文调用，抽取结构化人物并写入「人物档案」，同时留存摘要
         task_queue.submit(
-            character_service.analyze_and_create_characters,
-            novel_id=novel_id, owner_id=user.id,
-            novel_name=novel.name, summary=novel.summary or "",
-            async_task_id=task.id,
-        )
+            fast_analysis_service.run_turbo, novel_id, user.id, "character", task.id)
         return success({
-            "task_id": task.id, "mode": "deep",
+            "task_id": task.id, "mode": "turbo",
             "estimated_minutes": est["estimated_minutes"],
             "is_long_task": est["is_long_task"],
             "estimated_complete_at": est["estimated_complete_at"],
-        }, "已启动人物分析")
-    except Exception as e:
-        print(f"[ANALYZE ERROR] {e}")
-        traceback.print_exc()
-        raise BizError(500, f"人物分析启动失败: {str(e)}")
+        }, "已启动极速人物分析")
+    task_queue.submit(
+        character_service.analyze_and_create_characters,
+        novel_id=novel_id, owner_id=user.id,
+        novel_name=novel.name, summary=novel.summary or "",
+        async_task_id=task.id,
+    )
+    return success({
+        "task_id": task.id, "mode": "deep",
+        "estimated_minutes": est["estimated_minutes"],
+        "is_long_task": est["is_long_task"],
+        "estimated_complete_at": est["estimated_complete_at"],
+    }, "已启动人物分析")
+
+
+@novel_router.post("/{novel_id}/analyze-chapters")
+async def analyze_chapters(
+    novel_id: int,
+    body: AnalyzeChapters,
+    user: User = Depends(get_current_user),
+    session=Depends(get_session),
+):
+    """按选定章节分析人物（M6.8）：仅对指定章节正文抽取人物并写入人物档案。
+
+    后台异步执行，立即返回统一 task_id 供仪表盘轮询进度。
+    """
+    novel = await novel_repo.get_novel(session, user.id, novel_id)
+    if not novel:
+        raise BizError(404, "小说不存在")
+    if not body.chapter_ids:
+        raise BizError(400, "请至少选择 1 个章节")
+    est = task_estimation.estimate_task_duration(0, "deep")
+    task = await task_service.create_task(
+        session, user.id, "character_analysis",
+        f"小说{novel.name}-章节人物分析", novel_id=novel_id,
+        extra={"mode": "deep", "chapter_ids": body.chapter_ids},
+        estimated_duration_minutes=est["estimated_minutes"],
+        is_long_task=est["is_long_task"],
+        estimated_complete_at=est["estimated_complete_at"],
+    )
+    task_queue.submit(
+        character_service.analyze_and_create_characters,
+        novel_id=novel_id, owner_id=user.id,
+        novel_name=novel.name, summary=novel.summary or "",
+        async_task_id=task.id, chapter_ids=body.chapter_ids,
+    )
+    return success({
+        "task_id": task.id, "mode": "deep",
+        "estimated_minutes": est["estimated_minutes"],
+        "is_long_task": est["is_long_task"],
+        "estimated_complete_at": est["estimated_complete_at"],
+    }, "已启动章节人物分析")

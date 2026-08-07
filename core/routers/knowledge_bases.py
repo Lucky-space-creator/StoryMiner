@@ -24,6 +24,7 @@ from common import task_queue
 from schemas.knowledge_base import KBCreate, KBUpdate, BuildRequest
 from schemas.chunk import ChunkRequest
 from services import kb_service, chunk_service, task_service
+from services.task_estimation import estimate_task_duration
 from repositories import novel_repo, kb_repo
 
 router = APIRouter(prefix="/knowledge-bases", tags=["knowledge-bases"])
@@ -128,6 +129,7 @@ async def chunk_kb(
 
     关键点：触发前自动将小说下所有已解析完成的文档纳入该知识库（幂等，已纳入则跳过），
     避免因文档未纳管导致构建成功但切片为 0 的问题。
+    索引构建统一标记为长任务，前端指引至「长任务中心」查看进度。
     """
     kb = await kb_repo.get_kb(session, user.id, kb_id)
     if not kb:
@@ -137,9 +139,24 @@ async def chunk_kb(
     await session.commit()
     novel = await novel_repo.get_novel(session, user.id, kb.novel_id)
     novel_name = novel.name if novel else f"知识库{kb_id}"
-    task = await task_service.create_task(session, user.id, "chunk", f"小说{novel_name}-构建索引", novel_id=kb.novel_id, kb_id=kb_id, extra={"mode": "full"})
+    # chunk 模式预估耗时，强制标记为长任务
+    # 真实字数来自各章节 word_count 之和（Novel 模型无 word_count 字段）
+    _wc = await novel_repo.sum_chapters_word_count(session, kb.novel_id)
+    est = estimate_task_duration(_wc, "chunk")
+    task = await task_service.create_task(
+        session, user.id, "chunk", f"小说{novel_name}-构建索引",
+        novel_id=kb.novel_id, kb_id=kb_id, extra={"mode": "full"},
+        estimated_duration_minutes=est["estimated_minutes"],
+        is_long_task=est["is_long_task"],
+        estimated_complete_at=est["estimated_complete_at"],
+    )
     task_queue.submit(chunk_service.chunk_and_index_async, user.id, kb_id, data, False, task.id)
-    return success({"task_id": task.id}, "已启动切割")
+    return success({
+        "task_id": task.id,
+        "estimated_minutes": est["estimated_minutes"],
+        "is_long_task": est["is_long_task"],
+        "estimated_complete_at": est["estimated_complete_at"],
+    }, "已启动切割")
 
 
 @router.post("/{kb_id}/build")
@@ -148,14 +165,31 @@ async def build_kb(
     background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user), session=Depends(get_session),
 ):
-    """构建索引（方案A：单选文档）：校验并将文档纳入知识库，后台切分向量化该文档。"""
+    """构建索引（方案A：单选文档）：校验并将文档纳入知识库，后台切分向量化该文档。
+    索引构建统一标记为长任务，前端指引至「长任务中心」查看进度。
+    """
     await kb_service.add_document_to_kb(session, user.id, kb_id, data.doc_id)
     kb = await kb_repo.get_kb(session, user.id, kb_id)
     novel = await novel_repo.get_novel(session, user.id, kb.novel_id)
     novel_name = novel.name if novel else f"知识库{kb_id}"
-    task = await task_service.create_task(session, user.id, "chunk", f"小说{novel_name}-构建索引", novel_id=kb.novel_id, kb_id=kb_id, doc_id=data.doc_id, extra={"mode": "build"})
+    # chunk 模式预估耗时，强制标记为长任务
+    # 真实字数来自各章节 word_count 之和（Novel 模型无 word_count 字段）
+    _wc = await novel_repo.sum_chapters_word_count(session, kb.novel_id)
+    est = estimate_task_duration(_wc, "chunk")
+    task = await task_service.create_task(
+        session, user.id, "chunk", f"小说{novel_name}-构建索引",
+        novel_id=kb.novel_id, kb_id=kb_id, doc_id=data.doc_id, extra={"mode": "build"},
+        estimated_duration_minutes=est["estimated_minutes"],
+        is_long_task=est["is_long_task"],
+        estimated_complete_at=est["estimated_complete_at"],
+    )
     task_queue.submit(chunk_service.build_doc_async, user.id, kb_id, data.doc_id, data, task.id)
-    return success({"task_id": task.id}, "已启动构建")
+    return success({
+        "task_id": task.id,
+        "estimated_minutes": est["estimated_minutes"],
+        "is_long_task": est["is_long_task"],
+        "estimated_complete_at": est["estimated_complete_at"],
+    }, "已启动构建")
 
 
 @router.put("/{kb_id}/chunk-strategy")
@@ -177,6 +211,7 @@ async def reindex(
 
     关键点：触发前自动将小说下所有已解析完成的文档纳入该知识库（幂等，已纳入则跳过），
     避免因文档未纳管导致重建成功但切片为 0 的问题。
+    索引重建统一标记为长任务，前端指引至「长任务中心」查看进度。
     """
     kb = await kb_repo.get_kb(session, user.id, kb_id)
     if not kb:
@@ -186,9 +221,24 @@ async def reindex(
     await session.commit()
     novel = await novel_repo.get_novel(session, user.id, kb.novel_id)
     novel_name = novel.name if novel else f"知识库{kb_id}"
-    task = await task_service.create_task(session, user.id, "chunk", f"小说{novel_name}-重建索引", novel_id=kb.novel_id, kb_id=kb_id, extra={"mode": "full"})
+    # chunk 模式预估耗时，强制标记为长任务
+    # 真实字数来自各章节 word_count 之和（Novel 模型无 word_count 字段）
+    _wc = await novel_repo.sum_chapters_word_count(session, kb.novel_id)
+    est = estimate_task_duration(_wc, "chunk")
+    task = await task_service.create_task(
+        session, user.id, "chunk", f"小说{novel_name}-重建索引",
+        novel_id=kb.novel_id, kb_id=kb_id, extra={"mode": "full"},
+        estimated_duration_minutes=est["estimated_minutes"],
+        is_long_task=est["is_long_task"],
+        estimated_complete_at=est["estimated_complete_at"],
+    )
     task_queue.submit(chunk_service.chunk_and_index_async, user.id, kb_id, data, True, task.id)
-    return success({"task_id": task.id}, "已启动重建")
+    return success({
+        "task_id": task.id,
+        "estimated_minutes": est["estimated_minutes"],
+        "is_long_task": est["is_long_task"],
+        "estimated_complete_at": est["estimated_complete_at"],
+    }, "已启动重建")
 
 
 @router.post("/{kb_id}/incremental-index")

@@ -198,7 +198,6 @@ import { PhParagraph } from '@phosphor-icons/vue'
 import { getKB, getKBStats, getKBDocuments, buildKB, reindexKB } from '@/api/knowledgeBases'
 import { listNovelDocuments } from '@/api/novels'
 import { listLlm } from '@/api/llmConfigs'
-import { getTask } from '@/api/tasks'
 import { listChunks, getChunk } from '@/api/chunks'
 import { formatDateTime } from '@/utils/datetime'
 import { useToast } from '@/composables/useToast'
@@ -370,7 +369,8 @@ async function runBuild() {
     myTaskId.value = taskId
     taskStore.upsert({ id: taskId, type: 'chunk', name: `小说${kb.value.novel_name}-构建索引`, progress: 0, stage: '已提交，后台处理中', status: 'running' })
     taskStore.show()
-    notify('已提交，正在后台处理中…', 'info')
+    // 索引构建统一走长任务中心
+    notify(`索引构建已启动（任务 #${taskId}），预估耗时 ${res.data?.estimated_minutes || '?'} 分钟，请前往「长任务中心」（侧边栏可进入）查看进度`, 'info', 6000)
   } catch (e) {
     notify(e?.message || '构建触发失败', 'error')
   }
@@ -430,7 +430,8 @@ async function runReindex() {
     myTaskId.value = taskId
     taskStore.upsert({ id: taskId, type: 'chunk', name: `小说${kb.value.novel_name}-重建索引`, progress: 0, stage: '已提交，后台处理中', status: 'running' })
     taskStore.show()
-    notify('已提交，正在后台处理中…', 'info')
+    // 索引重建统一走长任务中心
+    notify(`索引重建已启动（任务 #${taskId}），预估耗时 ${res.data?.estimated_minutes || '?'} 分钟，请前往「长任务中心」（侧边栏可进入）查看进度`, 'info', 6000)
   } catch (e) {
     notify(e?.message || '重建索引失败', 'error')
   }

@@ -151,6 +151,14 @@ class LangChainAdapter:
         当 json_mode=True 时，按 provider 施加 JSON 输出约束：
         ollama 走 bind(format="json")；其余（openai 兼容）走 response_format=json_object。
         该约束对 7B 本地模型尤为关键——否则其常返回非 JSON 的乱码/散文。
+
+        关键点（V20 修复）：
+            langchain_ollama 0.3.x 在 bind(temperature=...) 时，会把 temperature 作为
+            顶层 **kwargs 透传到底层 ollama.AsyncClient.chat()，而 ollama 0.6.x 的
+            chat() 签名不接受 temperature 顶层参数，从而抛
+            "AsyncClient.chat() got an unexpected keyword argument 'temperature'"。
+            因此 ollama 必须把采样参数放进 options 字典（bind(options={...})），
+            由 langchain_ollama 正确归入请求的 options 字段，避免透传报错。
         """
         filtered = {
             k: v
@@ -166,10 +174,15 @@ class LangChainAdapter:
             else:
                 model = model.bind(**{"response_format": {"type": "json_object"}})
         if filtered:
-            # ollama 用 num_predict 表达 max_tokens，做兼容转换
-            if provider == "ollama" and "max_tokens" in filtered:
-                filtered["num_predict"] = filtered.pop("max_tokens")
-            model = model.bind(**filtered)
+            if provider == "ollama":
+                # ollama 采样参数必须放入 options 字典，否则 langchain_ollama 会透传到
+                # AsyncClient.chat() 顶层触发 TypeError；num_predict 是 ollama 表达 max_tokens 的键。
+                ollama_opts = dict(filtered)
+                if "max_tokens" in ollama_opts:
+                    ollama_opts["num_predict"] = ollama_opts.pop("max_tokens")
+                model = model.bind(options=ollama_opts)
+            else:
+                model = model.bind(**filtered)
         return model
 
     async def chat(self, messages: list, json_mode: bool = False, **opts) -> str:
@@ -229,25 +242,22 @@ def get_adapter(cfg: LLMConfig, api_key: str | None = None) -> LangChainAdapter:
     return LangChainAdapter(cfg, api_key)
 
 
-async def invoke_with_usage(model, prompt_value, *, owner_id, task_type, config_id=None):
-    """执行调用并回写用量（复用现有 record_llm_usage），供需要即时记录用量的场景使用。"""
+async def invoke_with_usage(model, prompt_value):
+    """执行调用并返回 (响应, usage_dict)。
+    调用方自行累积 usage，由任务结束时 update_task_progress 统一写入 story_llm_usage。
+    不在执行过程中逐次写入 DB，减少 IO 压力。
+    """
     resp = await model.ainvoke(prompt_value)
     meta = getattr(resp, "usage_metadata", None) or {}
-    from services.task_service import record_llm_usage
-
     model_name = None
     rm = getattr(resp, "response_metadata", None)
     if isinstance(rm, dict):
         model_name = rm.get("model_name")
     if not model_name:
         model_name = getattr(model, "model_name", None)
-
-    await record_llm_usage(
-        owner_id=owner_id,
-        config_id=config_id,
-        model=model_name,
-        task_type=task_type,
-        tokens_in=meta.get("input_tokens", 0),
-        tokens_out=meta.get("output_tokens", 0),
-    )
-    return resp
+    usage = {
+        "tokens_in": meta.get("input_tokens", 0),
+        "tokens_out": meta.get("output_tokens", 0),
+        "model": model_name,
+    }
+    return resp, usage

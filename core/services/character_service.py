@@ -172,15 +172,14 @@ async def generate_profile(session: AsyncSession, char_id: int, owner_id: int, t
         if u:
             tok_in += u.get("tokens_in", 0)
             tok_out += u.get("tokens_out", 0)
-        # 用户主动取消：回写已消耗 token 后中止
+        # 用户主动取消：回写已消耗 token 至任务记录，raise 由外层统一写入 story_llm_usage
         if task_id and task_cancel.is_cancelled(task_id):
-            if tok_in or tok_out:
-                await task_service.record_llm_usage(
-                    owner_id=owner_id, config_id=config_id, model=model_name,
-                    task_type="character", tokens_in=tok_in, tokens_out=tok_out,
-                )
-            await task_service.update_task_progress(task_id, tokens_in=tok_in, tokens_out=tok_out)
-            raise task_cancel.TaskCancelled("用户主动取消小传生成", tok_in, tok_out)
+            await session.rollback()
+            if task_id:
+                await task_service.update_task_progress(task_id, tokens_in=tok_in, tokens_out=tok_out)
+            exc = task_cancel.TaskCancelled("用户主动取消小传生成", tok_in, tok_out)
+            exc.usage_info = {"config_id": config_id, "model": model_name}
+            raise exc
         d = _parse_json(raw)
         if isinstance(d, dict):
             profiles.append(d)
@@ -197,14 +196,12 @@ async def generate_profile(session: AsyncSession, char_id: int, owner_id: int, t
         # 出场次数基于全量正文统计（不再受截断影响）
         c.appearances = full_text.count(c.name)
         await session.commit()
-    if tok_in or tok_out:
-        await task_service.record_llm_usage(
-            owner_id=owner_id, config_id=config_id, model=model_name,
-            task_type="character", tokens_in=tok_in, tokens_out=tok_out,
-        )
-        if task_id:
-            await task_service.update_task_progress(task_id, tokens_in=tok_in, tokens_out=tok_out)
-    return _to_detail(c)
+    # token 由 generate_profile_async 终态统一写入 story_llm_usage
+    if task_id:
+        await task_service.update_task_progress(task_id, tokens_in=tok_in, tokens_out=tok_out)
+    # 返回 (人物详情, 用量元信息) 供外层统一写 DB
+    token_meta = {"tokens_in": tok_in, "tokens_out": tok_out, "config_id": config_id, "model": model_name}
+    return _to_detail(c), token_meta
 
 
 def _parse_json(raw: str) -> dict:
@@ -338,24 +335,36 @@ async def _stream_collect(adapter, messages: list[dict], task_id, lo: int, hi: i
 
 
 async def generate_profile_async(char_id: int, owner_id: int, task_id: int | None = None) -> None:
-    """后台生成小传：自开会话调用 generate_profile，进度回写统一任务，异常仅记录不抛出。"""
+    """后台生成小传：自开会话调用 generate_profile，进度回写统一任务，异常仅记录不抛出。
+    token 用量由终态 update_task_progress 统一写入 story_llm_usage，不逐次写 DB。
+    """
     from db import SessionLocal
     async with SessionLocal() as session:
+        token_meta = None
         try:
             if task_id:
                 await task_service.update_task_progress(task_id, stage="generating", progress=30, status="running", started_at=datetime.now(timezone.utc))
-            await generate_profile(session, char_id, owner_id, task_id)
-            if task_id:
-                await task_service.update_task_progress(task_id, stage="done", progress=100, status="success", finished_at=datetime.now(timezone.utc))
+            result, token_meta = await generate_profile(session, char_id, owner_id, task_id)
+            if task_id and token_meta:
+                usage_info = {"config_id": token_meta.get("config_id"), "model": token_meta.get("model"), "task_type": "character"}
+                await task_service.update_task_progress(
+                    task_id, stage="done", progress=100, status="success",
+                    finished_at=datetime.now(timezone.utc),
+                    tokens_in=token_meta.get("tokens_in", 0), tokens_out=token_meta.get("tokens_out", 0),
+                    usage_info=usage_info,
+                )
         except Exception as e:  # 后台任务异常不应影响主流程
             from common.task_errors import to_user_error
             logger.exception("人物小传生成失败 char=%s: %s", char_id, e)
             if task_id:
                 if isinstance(e, task_cancel.TaskCancelled):
+                    # 从异常中提取 usage_info（generate_profile 取消时已附加）
+                    ui = getattr(e, "usage_info", None)
                     await task_service.update_task_progress(
                         task_id, stage="cancelled", status="cancelled",
                         error=e.reason, finished_at=datetime.now(timezone.utc),
-                        tokens_in=e.tokens_in, tokens_out=e.tokens_out,
+                        tokens_in=e.tokens_in or 0, tokens_out=e.tokens_out or 0,
+                        usage_info=ui,
                     )
                 else:
                     await task_service.update_task_progress(task_id, stage="failed", status="failed", error=to_user_error(e), finished_at=datetime.now(timezone.utc))
@@ -404,17 +413,28 @@ def _extract_context(text: str, name: str, max_chars: int = 4000) -> str:
     return "\n……\n".join(snippets)[:max_chars]
 
 
-async def _call_llm(messages, *, owner_id, task_type, config_id, cfg):
-    """经 LangChain 调用层发起 LLM 调用（M1/M3）。
+async def _call_llm(messages, *, cfg):
+    """经 LangChain 调用层发起 LLM 调用，返回 (文本, usage_dict)。
+    usage 由调用方累积，任务结束时由 update_task_progress 统一写入，不逐次写 DB。
 
-    返回 (文本, usage)；usage 已由 invoke_with_usage 写入 story_llm_usage，故返回 None。
+    关键点（V20 修复）：
+        串行任务队列仅单 worker，单个 LLM 调用若因第三方端点挂起而无限阻塞，
+        会饿死整条队列致使后续所有长任务卡在 pending。ChatOpenAI 的 timeout 在
+        异步网络挂起场景下未必生效，故此处用 asyncio.wait_for 套一层硬超时兜底，
+        超时即抛，由上层 try/except 捕获并回写任务失败，释放 worker。
     """
-    from llm.langchain_factory import get_langchain_model, invoke_with_usage
+    import asyncio
+    from llm.langchain_factory import get_langchain_model, invoke_with_usage, CHAT_TIMEOUT
     model = get_langchain_model(cfg)
-    resp = await invoke_with_usage(
-        model, messages, owner_id=owner_id, task_type=task_type, config_id=config_id)
+    try:
+        resp, usage = await asyncio.wait_for(
+            invoke_with_usage(model, messages),
+            timeout=CHAT_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        raise BizError(504, f"大模型调用超时（>{int(CHAT_TIMEOUT)}s），请检查 LLM 配置的 base_url 与网络连通性")
     content = getattr(resp, "content", None)
-    return (content if isinstance(content, str) else str(resp), None)
+    return (content if isinstance(content, str) else str(resp), usage)
 
 
 async def _analyze_candidates(session, novel_id, owner_id, full_text, cands, async_task_id):
@@ -439,18 +459,14 @@ async def _analyze_candidates(session, novel_id, owner_id, full_text, cands, asy
             await task_service.update_task_progress(
                 async_task_id, stage="analyzing", progress=lo, status="running")
         if async_task_id and task_cancel.is_cancelled(async_task_id):
-            if tok_in or tok_out:
-                await task_service.record_llm_usage(
-                    owner_id=owner_id, config_id=config_id, model=cfg.model,
-                    task_type="character_analysis", tokens_in=tok_in, tokens_out=tok_out)
             await task_service.update_task_progress(async_task_id, tokens_in=tok_in, tokens_out=tok_out)
-            raise task_cancel.TaskCancelled("用户主动取消人物", tok_in, tok_out)
+            exc = task_cancel.TaskCancelled("用户主动取消人物", tok_in, tok_out)
+            exc.usage_info = {"config_id": config_id, "model": cfg.model}
+            raise exc
         context = _extract_context(full_text, name)
         prompt = _CANDIDATE_PROMPT.replace("{name}", name).replace("{text}", context)
         messages = [{"role": "user", "content": prompt}]
-        text, usage = await _call_llm(
-            messages, owner_id=owner_id, task_type="character_analysis",
-            config_id=config_id, cfg=cfg)
+        text, usage = await _call_llm(messages, cfg=cfg)
         if usage:
             tok_in += usage.get("tokens_in", 0)
             tok_out += usage.get("tokens_out", 0)
@@ -476,16 +492,14 @@ async def _analyze_candidates(session, novel_id, owner_id, full_text, cands, asy
         session.add(c_obj)
         created += 1
     await session.commit()
-    if tok_in or tok_out:
-        await task_service.record_llm_usage(
-            owner_id=owner_id, config_id=config_id, model=cfg.model,
-            task_type="character_analysis", tokens_in=tok_in, tokens_out=tok_out)
+    # token 用量由终态 update_task_progress 统一写入 story_llm_usage
+    usage_info = {"config_id": config_id, "model": cfg.model, "task_type": "character_analysis"}
     if async_task_id:
         await task_service.update_task_progress(
             async_task_id, stage="done", progress=100, status="success",
             message=f"已创建 {created} 个人物" + (f"，跳过 {skipped} 个已存在" if skipped else ""),
             finished_at=datetime.now(timezone.utc),
-            tokens_in=tok_in, tokens_out=tok_out,
+            tokens_in=tok_in, tokens_out=tok_out, usage_info=usage_info,
             extra={"created": created, "skipped": skipped, "candidates": n})
     return {"created": created, "skipped": skipped, "candidates": n}
 
@@ -512,11 +526,16 @@ async def analyze_via_graph(session, novel_id, owner_id, full_text, cands, async
     created = final["created"]
     skipped = final["skipped"]
     n = len(final["candidates"])
+    # 从 graph state 中提取累积的 token 用量，终态统一写入 story_llm_usage
+    tok_in = final.get("tok_in", 0)
+    tok_out = final.get("tok_out", 0)
     if async_task_id:
+        usage_info = {"config_id": config_id, "model": cfg.model, "task_type": "character_analysis_graph"}
         await task_service.update_task_progress(
             async_task_id, stage="done", progress=100, status="success",
             message=f"已创建 {created} 个人物" + (f"，跳过 {skipped} 个已存在" if skipped else ""),
             finished_at=datetime.now(timezone.utc),
+            tokens_in=tok_in, tokens_out=tok_out, usage_info=usage_info,
             extra={"created": created, "skipped": skipped, "candidates": n})
     return {"created": created, "skipped": skipped, "candidates": n}
 
@@ -552,6 +571,7 @@ _ANALYZE_PROMPT = """你是小说人物分析助手，请根据提供的小说�
 async def analyze_and_create_characters(
     novel_id: int, owner_id: int, novel_name: str, summary: str,
     async_task_id: int | None = None,
+    chapter_ids: list[int] | None = None,
 ) -> dict:
     """异步分析小说并自动创建人物档案（后台任务，支持长文分片 + 流式进度）。
 
@@ -576,10 +596,15 @@ async def analyze_and_create_characters(
                     async_task_id, stage="preparing", progress=5, status="running",
                     started_at=datetime.now(timezone.utc),
                 )
-            # 取章节正文（全量，非分页元组）
-            chapters = await novel_repo.list_all_chapters(session, novel_id)
-            if not chapters:
-                raise BizError(400, "该小说暂无章节正文，请先上传并解析文档")
+            # 取章节正文：指定 chapter_ids 时仅取这些章节，否则取全量
+            if chapter_ids:
+                chapters = await novel_repo.list_chapters_by_ids(session, novel_id, chapter_ids)
+                if not chapters:
+                    raise BizError(400, "指定的章节不存在或不属于该小说")
+            else:
+                chapters = await novel_repo.list_all_chapters(session, novel_id)
+                if not chapters:
+                    raise BizError(400, "该小说暂无章节正文，请先上传并解析文档")
             full_text = "\n".join(ch.content for ch in chapters)
             # ── M3/M7 混合管道：确定性层优先（候选精析） ──
             # 先 nlp 零成本产出人物候选与准确出现次数，再 LLM 逐候选精析小传；
@@ -618,16 +643,13 @@ async def analyze_and_create_characters(
                 if u:
                     tok_in += u.get("tokens_in", 0)
                     tok_out += u.get("tokens_out", 0)
-                # 用户主动取消：当前分片已消耗 token 需回写，随后中止
+                # 用户主动取消：当前分片已消耗 token，上报至异常由外层统一写入 DB
                 if async_task_id and task_cancel.is_cancelled(async_task_id):
-                    if tok_in or tok_out:
-                        await task_service.record_llm_usage(
-                            owner_id=owner_id, config_id=config_id, model=model_name,
-                            task_type="character_analysis", tokens_in=tok_in, tokens_out=tok_out,
-                        )
                     await task_service.update_task_progress(
                         async_task_id, tokens_in=tok_in, tokens_out=tok_out)
-                    raise task_cancel.TaskCancelled("用户主动取消人物", tok_in, tok_out)
+                    exc = task_cancel.TaskCancelled("用户主动取消人物", tok_in, tok_out)
+                    exc.usage_info = {"config_id": config_id, "model": model_name}
+                    raise exc
                 chars_data = _parse_json(raw)
                 if isinstance(chars_data, list):
                     all_chars.extend(chars_data)
@@ -669,29 +691,23 @@ async def analyze_and_create_characters(
                 created += 1
             await session.commit()
 
-            if tok_in or tok_out:
-                await task_service.record_llm_usage(
-                    owner_id=owner_id, config_id=config_id, model=model_name,
-                    task_type="character_analysis", tokens_in=tok_in, tokens_out=tok_out,
-                )
+            # token 用量由终态 update_task_progress 统一写入 story_llm_usage
+            usage_info = {"config_id": config_id, "model": model_name, "task_type": "character_analysis"}
 
             # 收尾前再次确认是否被取消（避免取消请求晚于进度回写导致状态回退为成功）
             if async_task_id and task_cancel.is_cancelled(async_task_id):
-                if tok_in or tok_out:
-                    await task_service.record_llm_usage(
-                        owner_id=owner_id, config_id=config_id, model=model_name,
-                        task_type="character_analysis", tokens_in=tok_in, tokens_out=tok_out,
-                    )
                 await task_service.update_task_progress(
                     async_task_id, tokens_in=tok_in, tokens_out=tok_out)
-                raise task_cancel.TaskCancelled("用户主动取消人物", tok_in, tok_out)
+                exc = task_cancel.TaskCancelled("用户主动取消人物", tok_in, tok_out)
+                exc.usage_info = usage_info
+                raise exc
 
             if async_task_id:
                 await task_service.update_task_progress(
                     async_task_id, stage="done", progress=100, status="success",
                     message=f"已创建 {created} 个人物" + (f"，跳过 {skipped} 个已存在" if skipped else ""),
                     finished_at=datetime.now(timezone.utc),
-                    tokens_in=tok_in, tokens_out=tok_out,
+                    tokens_in=tok_in, tokens_out=tok_out, usage_info=usage_info,
                     extra={"created": created, "skipped": skipped, "chunks": n},
                 )
             return {"created": created, "skipped": skipped, "chunks": n}
@@ -701,11 +717,13 @@ async def analyze_and_create_characters(
             from common.task_errors import to_user_error
             if async_task_id:
                 if isinstance(e, task_cancel.TaskCancelled):
-                    # 用户主动取消：状态置为 cancelled，token 消耗已在中止点回写
+                    # 从异常中提取 usage_info（各取消检查点已附加），终态统一写入
+                    ui = getattr(e, "usage_info", None)
                     await task_service.update_task_progress(
                         async_task_id, stage="cancelled", status="cancelled",
                         error=e.reason, finished_at=datetime.now(timezone.utc),
-                        tokens_in=e.tokens_in, tokens_out=e.tokens_out,
+                        tokens_in=e.tokens_in or 0, tokens_out=e.tokens_out or 0,
+                        usage_info=ui,
                     )
                     return {"created": 0, "skipped": 0, "cancelled": True, "chunks": n}
                 await task_service.update_task_progress(

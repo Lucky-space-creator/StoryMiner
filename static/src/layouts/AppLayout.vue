@@ -66,12 +66,12 @@ import { useRoute, useRouter } from 'vue-router'
 import { useUserStore } from '@/stores/user'
 import { useThemeStore } from '@/stores/theme'
 import { listNovels } from '@/api/novels'
-import { useTaskPoller } from '@/composables/useTaskPoller'
+import { useTaskSSE } from '@/composables/useTaskSSE'
 import {
   PhBookOpen, PhSignOut, PhSun, PhMoon,
   PhGauge, PhBooks, PhDatabase, PhParagraph,
   PhGraph, PhUsers, PhPenNib,
-  PhCpu, PhPuzzlePiece, PhPlugs, PhFileText, PhCompass,
+  PhCpu, PhPuzzlePiece, PhPlugs, PhCompass, PhFilmStrip,
   PhClock
 } from '@phosphor-icons/vue'
 import ProgressWindow from '@/components/ui/ProgressWindow.vue'
@@ -81,8 +81,8 @@ const router = useRouter()
 const user = useUserStore()
 const theme = useThemeStore()
 
-// 全局异步任务轮询：每 5s 拉取进行中任务刷新悬浮窗/仪表盘，并在完成时弹窗通知
-useTaskPoller(5000)
+// 全局异步任务实时流（SSE）：替代原 5s 轮询 /tasks/running，后端进度回写时主动推送
+useTaskSSE()
 
 // 动态取第一个小说，供「知识图谱/人物档案」导航使用，避免写死 id=1 跳到不存在的小说
 const novels = ref([])
@@ -117,6 +117,7 @@ const nav = computed(() => [
     items: [
       { to: firstNovelId.value ? `/novels/${firstNovelId.value}/graph` : '/novels', label: '知识图谱', icon: PhGraph },
       { to: firstNovelId.value ? `/novels/${firstNovelId.value}/characters` : '/novels', label: '人物档案', icon: PhUsers },
+      { to: firstNovelId.value ? `/novels/${firstNovelId.value}/chapter-dramas` : '/novels', label: '章节漫剧', icon: PhFilmStrip },
       { to: '/writing', label: '续写与概览', icon: PhPenNib }
     ]
   },
@@ -126,7 +127,6 @@ const nav = computed(() => [
       { to: '/llm-configs', label: '模型管理', icon: PhCpu },
       { to: '/skills', label: 'Skill', icon: PhPuzzlePiece },
       { to: '/mcp', label: 'MCP', icon: PhPlugs },
-      { to: '/prompts', label: 'Prompt', icon: PhFileText },
       { to: '/explore', label: '扩展', icon: PhCompass }
     ]
   }

@@ -61,3 +61,10 @@ async def get_current_user(
     if not user:
         raise BizError(401, "用户不存在")
     return user
+
+
+async def get_current_user_minimal(uid: int | None, session: Annotated[AsyncSession, Depends(get_session)]) -> User | None:
+    """仅按用户 id 加载用户对象（不校验令牌），供 SSE 鉴权在已验 token 后取实体。"""
+    if uid is None:
+        return None
+    return await session.get(User, uid)

@@ -103,14 +103,13 @@
 // 关键点：章节正文按需加载（选中章节后才请求详情），减少初始数据传输量。
 // 实现逻辑：fetch 小说 → fetch 分页章节列表 → 自动选中第一个或指定章节 → 加载正文。
 import { ref, computed, onMounted } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { useRoute } from 'vue-router'
 import Button from '@/components/ui/Button.vue'
 import ReadingChat from '@/views/novels/ReadingChat.vue'
 import { getNovel, listChapters, getChapter } from '@/api/novels'
 import { useToast } from '@/composables/useToast'
 
 const route = useRoute()
-const router = useRouter()
 const { notify } = useToast()
 const chatVisible = ref(false)
 

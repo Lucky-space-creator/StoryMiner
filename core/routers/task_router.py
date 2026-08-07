@@ -2,25 +2,29 @@
 统一异步任务路由（/api/v1/tasks）
 
 整体思路：
-    暴露异步任务的列表、进行中列表、详情接口，供仪表盘总览与前端全局轮询使用。
+    暴露异步任务的列表、进行中列表、详情、SSE 实时流接口。
+    SSE 流（/tasks/stream）替代前端对 /running、/long 的定时轮询，后端在进度回写时主动推送。
 
 关键点：
     1. 全部依赖 get_current_user 取得 owner_id，实现数据隔离。
-    2. /running 仅返回进行中任务，供前端每 5s 轮询刷新进度。
+    2. /running 仅返回进行中任务（保留以兼容仪表盘等低频查询）。
     3. 详情校验归属，避免越权读取他人任务。
+    4. /stream 必须定义在 /{task_id} 之前，否则 FastAPI 会把 stream 当作 task_id 匹配。
 
 实现逻辑：
     委托 task_service；统一 success 包装，对齐 {code,msg,data} 契约。
 """
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
+from fastapi.responses import StreamingResponse
 from datetime import datetime, timezone
 
 from models.user import User
-from db import get_session
-from auth.jwt import get_current_user
+from db import get_session, SessionLocal
+from auth.jwt import get_current_user, get_current_user_minimal, decode_token
 from common.response import success
 from common.exceptions import BizError
 from common import task_cancel
+from common.task_pubsub import task_event_stream
 from services import task_service
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
@@ -76,6 +80,51 @@ async def long_tasks(
         session, user.id, status=status, type=type, is_long_task=True,
         page=page, page_size=page_size,
     ))
+
+
+async def _resolve_sse_user(request: Request, token: str | None = Query(None), session=Depends(get_session)) -> User:
+    """SSE 鉴权：优先 Authorization 头，缺省时回退 ?token= 查询参数（EventSource 无法自定义请求头）。"""
+    raw = request.headers.get("Authorization")
+    uid = None
+    if raw and raw.startswith("Bearer "):
+        uid = decode_token(raw.split(" ", 1)[1])
+    elif token:
+        uid = decode_token(token)
+    if uid is None:
+        raise BizError(401, "未登录")
+    user = await get_current_user_minimal(uid, session)
+    if not user:
+        raise BizError(401, "用户不存在")
+    return user
+
+
+@router.get("/stream")
+async def task_stream(
+    request: Request,
+    user: User = Depends(_resolve_sse_user),
+    session=Depends(get_session),
+):
+    """V20 统一任务实时流（SSE）：推送当前用户全部任务的进度/状态变更，替代前端定时轮询。
+
+    前端通过 EventSource('/api/v1/tasks/stream?token=...') 连接；后端在每次进度回写时广播快照。
+    事件类型：snapshot（全量）、task（单任务变更，含终态）。
+    """
+    async def _current_snapshot():
+        # 返回该用户最近的任务快照（进行中 + 近期结束），供连接建立时初始推送。
+        # 注意：此处必须用独立 SessionLocal()，不能复用路由注入的 session。
+        # 原因：StreamingResponse 开始迭代生成器时，路由函数已返回，依赖注入的
+        # session 已在 get_session 的 finally 中关闭；在其上执行查询会抛
+        # AsyncOperationError / InvalidRequestError，进而触发 HTTP 500 并中断 SSE 流，
+        # 前端 EventSource 因连接异常关闭而无限重连，造成界面卡死/数据消失的观感。
+        async with SessionLocal() as snap_session:
+            rows = await task_service.list_tasks(snap_session, user.id, limit=50)
+        return rows
+
+    return StreamingResponse(
+        task_event_stream(user.id, _current_snapshot, request),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/{task_id}")

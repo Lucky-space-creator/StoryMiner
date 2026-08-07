@@ -311,14 +311,10 @@ async def generate_ai_summary(
                 {"role": "user", "content": user_prompt},
             ]
             ai_text = await adapter.chat(messages, temperature=0.3, max_tokens=400)
-            # 记录 Token 用量到仪表盘
-            usage = adapter.get_last_usage()
-            if usage and cfg.id:
-                await task_service.record_llm_usage(
-                    owner_id=owner_id, config_id=cfg.id, model=cfg.model,
-                    task_type="summary", tokens_in=usage.get("tokens_in", 0),
-                    tokens_out=usage.get("tokens_out", 0),
-                )
+            # 收集 Token 用量，由终态 update_task_progress 统一写入 story_llm_usage
+            usage = adapter.get_last_usage() or {}
+            tok_in = usage.get("tokens_in", 0)
+            tok_out = usage.get("tokens_out", 0)
             # 硬截断兜底，确保 ≤200 字
             ai_summary = (ai_text or "").strip()[:200]
 
@@ -326,8 +322,10 @@ async def generate_ai_summary(
             await session.commit()
 
             if async_task_id:
+                usage_info = {"config_id": cfg.id, "model": cfg.model, "task_type": "summary"}
                 await task_service.update_task_progress(
                     async_task_id, stage="done", progress=100, status="success",
+                    tokens_in=tok_in, tokens_out=tok_out, usage_info=usage_info,
                 )
             logger.info("AI 概括生成成功：小说 %s", novel_id)
             return ai_summary

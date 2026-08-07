@@ -170,31 +170,32 @@ def _pair_context(text: str, a: str, b: str, max_chars: int = 3000) -> str:
     return "\n……\n".join(out)[:max_chars]
 
 
-async def _acall_llm(messages, *, owner_id: int, task_type: str, config_id: int, cfg):
-    """经 LangChain 调用层发起 LLM 调用（M6）。
-
-    返回 (文本, usage)；usage 已由 invoke_with_usage 写入 story_llm_usage，故返回 None。
+async def _acall_llm(messages, *, cfg):
+    """经 LangChain 调用层发起 LLM 调用，返回 (文本, usage_dict)。
+    usage 由调用方累积，任务结束时由 update_task_progress 统一写入，不逐次写 DB。
     """
     from llm.langchain_factory import get_langchain_model, invoke_with_usage
     model = get_langchain_model(cfg)
-    resp = await invoke_with_usage(
-        model, messages, owner_id=owner_id, task_type=task_type, config_id=config_id)
+    resp, usage = await invoke_with_usage(model, messages)
     content = getattr(resp, "content", None)
-    return (content if isinstance(content, str) else str(resp), None)
+    return (content if isinstance(content, str) else str(resp), usage)
 
 
 async def _qualify_relations(text: str, topk: list[dict], *, cfg, config_id: int,
-                            owner_id: int, task_id: int | None = None) -> tuple[list[dict], int]:
+                            owner_id: int, task_id: int | None = None) -> tuple[list[dict], int, int, int]:
     """M6 关系定性核心：对共现候选边逐条 LLM 定性（类型/方向/证据）。
 
-    返回 (all_relations, rel_calls)；调用次数 = len(topk)（远少于分块数），
+    返回 (all_relations, rel_calls, tok_in, tok_out)；调用次数 = len(topk)（远少于分块数），
     落实「调用降 ≥50%」。direction 决定 source/target 顺序，none 则保持原序。
+    token 用量由调用方累积，任务结束时统一写入 DB。
     """
     all_relations: list[dict] = []
     rel_calls = 0
+    tok_in = 0
+    tok_out = 0
     for i, edge in enumerate(topk):
         if task_id and task_cancel.is_cancelled(task_id):
-            raise task_cancel.TaskCancelled("用户主动取消任务")
+            raise task_cancel.TaskCancelled("用户主动取消任务", tok_in, tok_out)
         if task_id:
             await task_service.update_task_progress(
                 task_id, stage="qualifying_relations",
@@ -204,9 +205,10 @@ async def _qualify_relations(text: str, topk: list[dict], *, cfg, config_id: int
                   .replace("{b}", edge["target"]).replace("{ctx}", ctx))
         messages = [{"role": "system", "content": _REL_QUAL_SYSTEM},
                     {"role": "user", "content": prompt}]
-        raw, _usage = await _acall_llm(
-            messages, owner_id=owner_id, task_type="graph_relation",
-            config_id=config_id, cfg=cfg)
+        raw, usage = await _acall_llm(messages, cfg=cfg)
+        if usage:
+            tok_in += usage.get("tokens_in", 0)
+            tok_out += usage.get("tokens_out", 0)
         data = _parse_json(raw)
         if not isinstance(data, dict):
             continue
@@ -219,7 +221,7 @@ async def _qualify_relations(text: str, topk: list[dict], *, cfg, config_id: int
         all_relations.append({"source": sname, "target": tname,
                               "type": rtype, "evidence": data.get("evidence")})
         rel_calls += 1
-    return all_relations, rel_calls
+    return all_relations, rel_calls, tok_in, tok_out
 
 
 # ───────────────────────────── LLM 适配器 ─────────────────────────────
@@ -382,7 +384,11 @@ async def extract(session: AsyncSession, novel_id: int, owner_id: int, task_id: 
         2. 分块策略避免长文本超出 LLM 上下文窗口
         3. 跨块实体按 (name, type) 全局去重
         4. 事件实体的 profile 中记录参与者与时间信息
+        5. token 用量累积至末尾，由 run_extract 统一写入 DB，不逐次写
     """
+    # ── 局部 token 累积（全过程增量），取消时一并上报 ──
+    tok_in = 0
+    tok_out = 0
     # ---------- Step 1: 清空现有数据 ----------
     deleted = await graph_repo.delete_entities_by_novel(session, novel_id)
     print(f"[graph] 已清空 novel={novel_id} 的 {deleted} 个旧实体及其关系")
@@ -416,7 +422,7 @@ async def extract(session: AsyncSession, novel_id: int, owner_id: int, task_id: 
 
     for idx, chunk in enumerate(chunks, 1):
         if task_id and task_cancel.is_cancelled(task_id):
-            raise task_cancel.TaskCancelled("用户主动取消任务")
+            raise task_cancel.TaskCancelled("用户主动取消任务", tok_in, tok_out)
 
         # 更新进度（20%~85% 按块均匀分配，留出关系定性区间）
         if task_id:
@@ -432,9 +438,10 @@ async def extract(session: AsyncSession, novel_id: int, owner_id: int, task_id: 
             {"role": "system", "content": _ENTITY_SYSTEM},
             {"role": "user", "content": _ENTITY_USER.replace("{candidates}", cand_block).replace("{text}", chunk)},
         ]
-        raw, _usage = await _acall_llm(
-            messages, owner_id=owner_id, task_type="graph_entity",
-            config_id=config_id, cfg=cfg)
+        raw, usage = await _acall_llm(messages, cfg=cfg)
+        if usage:
+            tok_in += usage.get("tokens_in", 0)
+            tok_out += usage.get("tokens_out", 0)
         data = _parse_json(raw)
 
         chunk_ent = 0
@@ -472,8 +479,10 @@ async def extract(session: AsyncSession, novel_id: int, owner_id: int, task_id: 
     co_edges = nlp.build_cooccurrence(text)
     co_edges.sort(key=lambda e: e.get("weight", 0), reverse=True)
     topk = co_edges[:_COOCCUR_TOPK]
-    all_relations, rel_calls = await _qualify_relations(
+    all_relations, rel_calls, rel_tok_in, rel_tok_out = await _qualify_relations(
         text, topk, cfg=cfg, config_id=config_id, owner_id=owner_id, task_id=task_id)
+    tok_in += rel_tok_in
+    tok_out += rel_tok_out
     print(f"[graph] 关系定性: 候选边 {len(topk)} 条 → 有效关系 {rel_calls} 条 "
           f"（分块抽取 {chunk_count} 次 → 关系调用降至 {rel_calls} 次）")
 
@@ -507,7 +516,11 @@ async def extract(session: AsyncSession, novel_id: int, owner_id: int, task_id: 
         rel_count += 1
 
     await session.commit()
-    result = {"entity_count": len(all_entities), "relation_count": rel_count, "chunks": chunk_count}
+    result = {
+        "entity_count": len(all_entities), "relation_count": rel_count, "chunks": chunk_count,
+        "tokens_in": tok_in, "tokens_out": tok_out,
+        "config_id": config_id, "model": model_name,
+    }
     print(f"[graph] 抽取完成 novel={novel_id}: {result}")
     return result
 
@@ -536,26 +549,38 @@ async def run_extract(novel_id: int, owner_id: int, task_id: int | None = None) 
                     started_at=datetime.now(timezone.utc))
 
             result = await extract(session, novel_id, owner_id, task_id)
+            # 提取 token 用量和 LLM 配置信息，供终态统一写入
+            _tokens_in = result.get("tokens_in", 0)
+            _tokens_out = result.get("tokens_out", 0)
+            _usage_info = {"config_id": result.get("config_id"), "model": result.get("model"), "task_type": "graph_extract"}
 
             if task_id:
                 if task_cancel.is_cancelled(task_id):
                     await task_service.update_task_progress(
                         task_id, stage="cancelled", status="cancelled",
-                        error="用户主动取消任务", finished_at=datetime.now(timezone.utc))
+                        error="用户主动取消任务", finished_at=datetime.now(timezone.utc),
+                        tokens_in=_tokens_in, tokens_out=_tokens_out, usage_info=_usage_info)
                     return
                 await task_service.update_task_progress(
                     task_id, stage="done", progress=100, status="success",
                     finished_at=datetime.now(timezone.utc),
                     entity_count=result.get("entity_count", 0),
                     relation_count=result.get("relation_count", 0),
+                    tokens_in=_tokens_in, tokens_out=_tokens_out, usage_info=_usage_info,
                 )
             print(f"[graph] 抽取完成 novel={novel_id} {result}")
         except Exception as e:
             if task_id:
                 if isinstance(e, task_cancel.TaskCancelled):
+                    # 获取异常中已累积的 token + config 信息（extract 内 _qualify_relations 取消时会携带）
+                    ct_in = getattr(e, "tokens_in", 0) or 0
+                    ct_out = getattr(e, "tokens_out", 0) or 0
+                    # 从 result 获取 usage_info（正常流程），异常流程下回退到 task 自身信息
+                    cu = _usage_info if "_usage_info" in dir() else None
                     await task_service.update_task_progress(
                         task_id, stage="cancelled", status="cancelled",
-                        error=e.reason, finished_at=datetime.now(timezone.utc))
+                        error=e.reason, finished_at=datetime.now(timezone.utc),
+                        tokens_in=ct_in, tokens_out=ct_out, usage_info=cu)
                 else:
                     await task_service.update_task_progress(
                         task_id, stage="failed", status="failed",

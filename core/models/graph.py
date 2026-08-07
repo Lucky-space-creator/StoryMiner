@@ -67,7 +67,6 @@ class Entity(Base):
     profile: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
     avatar: Mapped[str | None] = mapped_column(String(512))
-    prompt_tpl_id: Mapped[int | None] = mapped_column(BigInteger)
     extra: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

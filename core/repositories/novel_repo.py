@@ -76,6 +76,18 @@ async def count_chapters(session: AsyncSession, novel_id: int) -> int:
     return (await session.execute(stmt)).scalar() or 0
 
 
+async def sum_chapters_word_count(session: AsyncSession, novel_id: int) -> int:
+    """统计小说未删除章节字数之和（Chapter.word_count 聚合）。
+
+    关键点：Novel 模型无 word_count 字段，小说总字数由各章节累加得到，
+    供任务预估（task_estimation）计算真实耗时，避免预估为 0。
+    """
+    stmt = select(func.coalesce(func.sum(Chapter.word_count), 0)).select_from(Chapter).where(
+        Chapter.novel_id == novel_id, Chapter.deleted_at.is_(None)
+    )
+    return (await session.execute(stmt)).scalar() or 0
+
+
 async def list_chapters(session: AsyncSession, novel_id: int, page: int = 1, size: int = 20, q: str | None = None) -> tuple[list[Chapter], int]:
     """分页查询小说章节（按章节号、ID 排序），支持标题模糊搜索。"""
     base = select(Chapter).where(
@@ -106,6 +118,21 @@ async def list_all_chapters(session: AsyncSession, novel_id: int) -> list[Chapte
 async def get_chapter(session: AsyncSession, chapter_id: int) -> Chapter | None:
     """按 ID 查询章节（含已删除，归属由 service 校验）。"""
     return await session.get(Chapter, chapter_id)
+
+
+async def list_chapters_by_ids(session: AsyncSession, novel_id: int, chapter_ids: list[int]) -> list[Chapter]:
+    """按 ID 列表取章节正文（校验归属小说，过滤逻辑删除），供按章节分析人物使用。
+
+    关键点：chapter_ids 来自前端选择，必须二次过滤 novel_id 防止越权读取其他小说章节。
+    """
+    if not chapter_ids:
+        return []
+    stmt = select(Chapter).where(
+        Chapter.novel_id == novel_id,
+        Chapter.id.in_(chapter_ids),
+        Chapter.deleted_at.is_(None),
+    ).order_by(Chapter.chapter_no, Chapter.id)
+    return list((await session.execute(stmt)).scalars().all())
 
 
 async def add_chapters(session: AsyncSession, chapters: list[Chapter]) -> None:

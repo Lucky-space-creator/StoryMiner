@@ -179,12 +179,15 @@ async def trigger_chapter_analysis(
         2. 同一小说可多次触发，每次覆盖之前的分析结果（幂等写入 extra 字段）。
         3. 返回 task_id 供前端跳转仪表盘查看进度。
         4. mode=turbo：极速摘要（情节概览）；mode=deep：深度全量逐章解析。
+        5. deep 模式统一标记为长任务，前端直接指引到「长任务中心」查看进度。
     """
     novel = await novel_repo.get_novel(session, user.id, novel_id)
     if not novel:
         raise BizError(404, "小说不存在")
     # V19：根据小说字数与处理模式预估任务耗时，区分长短任务
-    est = task_estimation.estimate_task_duration(novel.word_count or 0, mode)
+    # Novel 模型无 word_count 字段，从 extra 中获取或默认 0
+    _wc = (novel.extra or {}).get("word_count", 0) if novel.extra else 0
+    est = task_estimation.estimate_task_duration(_wc, mode)
     task = await task_service.create_task(
         session, user.id, type="chapter_analysis",
         name=f"章节解析·{novel.name}", novel_id=novel_id,

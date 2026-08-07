@@ -211,11 +211,11 @@ async def _run_character_turbo(session, novel_id, owner_id, full_text, task_id, 
             await task_service.update_task_progress(
                 task_id, stage="char_extract", progress=10 + int(35 * (i + 1) / n))
         if task_id and task_cancel.is_cancelled(task_id):
-            await task_service.record_llm_usage(
-                owner_id, None, "turbo", "turbo_character", tok_in, tok_out)
             await task_service.update_task_progress(
                 task_id, tokens_in=tok_in, tokens_out=tok_out)
-            raise task_cancel.TaskCancelled("用户主动取消人物", tok_in, tok_out)
+            exc = task_cancel.TaskCancelled("用户主动取消人物", tok_in, tok_out)
+            exc.usage_info = {"config_id": None, "model": "turbo"}
+            raise exc
 
     merged = _merge_characters(raw_chars)
     names = [c.get("name") for c in merged if (c.get("name") or "").strip()]
@@ -315,8 +315,8 @@ async def _run_character_turbo(session, novel_id, owner_id, full_text, task_id, 
             content=summary, fmt="markdown"))
     await session.commit()
 
-    await task_service.record_llm_usage(
-        owner_id, None, "turbo", "turbo_character", tok_in, tok_out)
+    # token 用量由终态 update_task_progress 统一写入 story_llm_usage
+    usage_info = {"config_id": None, "model": "turbo", "task_type": "turbo_character"}
 
     if task_id:
         msg = f"已创建 {created} 个人物档案"
@@ -327,8 +327,8 @@ async def _run_character_turbo(session, novel_id, owner_id, full_text, task_id, 
         await task_service.update_task_progress(
             task_id, stage="done", progress=100, status="success",
             finished_at=datetime.now(timezone.utc),
-            tokens_in=tok_in, tokens_out=tok_out, summary_chars=len(summary),
-            message=msg)
+            tokens_in=tok_in, tokens_out=tok_out, usage_info=usage_info,
+            summary_chars=len(summary), message=msg)
     print(f"[turbo] character 完成 novel={novel_id} chars={len(merged)} created={created} skipped={skipped}")
 
 
@@ -412,22 +412,25 @@ async def run_turbo(
                     content=summary, fmt="markdown"))
             await session.commit()
 
-            await task_service.record_llm_usage(
-                owner_id, None, "turbo", f"turbo_{analysis_type}", tok_in, tok_out)
+            # token 用量由终态 update_task_progress 统一写入 story_llm_usage
+            usage_info = {"config_id": None, "model": "turbo", "task_type": f"turbo_{analysis_type}"}
 
             if task_id:
                 await task_service.update_task_progress(
                     task_id, stage="done", progress=100, status="success",
                     finished_at=datetime.now(timezone.utc),
-                    tokens_in=tok_in, tokens_out=tok_out, summary_chars=len(summary))
+                    tokens_in=tok_in, tokens_out=tok_out, usage_info=usage_info,
+                    summary_chars=len(summary))
             print(f"[turbo] {analysis_type} 完成 novel={novel_id} chunks={n} chars={len(summary)}")
         except Exception as e:
             if task_id:
                 if isinstance(e, task_cancel.TaskCancelled):
+                    ui = getattr(e, "usage_info", None)
                     await task_service.update_task_progress(
                         task_id, stage="cancelled", status="cancelled",
                         error=e.reason, finished_at=datetime.now(timezone.utc),
-                        tokens_in=e.tokens_in, tokens_out=e.tokens_out)
+                        tokens_in=e.tokens_in or 0, tokens_out=e.tokens_out or 0,
+                        usage_info=ui)
                 else:
                     await task_service.update_task_progress(
                         task_id, stage="failed", status="failed",

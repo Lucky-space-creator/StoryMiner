@@ -21,6 +21,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models.async_task import AsyncTask
 from db import SessionLocal
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 async def create_task(
     session: AsyncSession, owner_id: int, type: str, name: str,
@@ -63,9 +67,13 @@ async def update_task_progress(
     status: str | None = None, error: str | None = None,
     started_at: datetime | None = None, finished_at: datetime | None = None,
     tokens_in: int | None = None, tokens_out: int | None = None,
+    usage_info: dict | None = None,
     **extra,
 ) -> AsyncTask | None:
-    """后台任务进度回写：独立会话更新，避免持有请求会话。"""
+    """后台任务进度回写：独立会话更新，避免持有请求会话。
+    任务进入终态（success/failed/cancelled）时，统一将累积 token 用量写入 story_llm_usage 表。
+    不在执行过程中逐次写入，减少 DB IO 次数。
+    """
     async with SessionLocal() as session:
         t = await session.get(AsyncTask, task_id)
         if not t:
@@ -89,6 +97,26 @@ async def update_task_progress(
         if extra:
             t.extra = {**(t.extra or {}), **extra}
         await session.commit()
+        # 任务进入终态时，统一将累积的 token 用量写入 story_llm_usage 表
+        # 不在执行过程中逐次写入，减少 DB IO 次数，提升系统性能
+        if status in ("success", "failed", "cancelled") and (tokens_in or tokens_out) and usage_info:
+            try:
+                await record_llm_usage(
+                    owner_id=t.owner_id,
+                    config_id=usage_info.get("config_id"),
+                    model=usage_info.get("model") or "",
+                    task_type=usage_info.get("task_type") or "",
+                    tokens_in=tokens_in or 0,
+                    tokens_out=tokens_out or 0,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("LLM 用量统一写入失败 task=%s: %s", task_id, e)
+        # V20：进度回写后向该 owner 的 SSE 订阅者广播快照，替代前端定时轮询
+        from common.task_pubsub import publish
+        try:
+            publish(t.owner_id, _out(t))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("任务进度广播失败 task=%s: %s", task_id, e)
         return t
 
 
