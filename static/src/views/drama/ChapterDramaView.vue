@@ -6,7 +6,7 @@
         <h2 class="text-lg font-semibold text-app">章节漫剧列</h2>
         <p class="text-xs text-muted mt-1">
           当前小说：<span class="text-app font-medium">{{ novelName || '加载中…' }}</span>
-          （共 {{ chapterOptions.length }} 章）· 选定连续章节（最多 5 章），自动解析出场角色，作为 AI 漫剧生产素材。
+          （共 {{ chapterOptions.length }} 章）· 逐章制作漫剧片段，每次选择一章，自动解析出场角色，作为 AI 漫剧生产素材。
         </p>
       </div>
       <Button @click="openCreate" :disabled="!chapterOptions.length" :title="chapterOptions.length ? '' : '该小说暂无章节，无法创建'">新建漫剧片段</Button>
@@ -39,7 +39,7 @@
         </div>
         <div class="flex items-center justify-between pr-12">
           <h3 class="font-medium text-app">{{ d.title }}</h3>
-          <span class="text-xs text-muted">第 {{ d.chapter_from }} - {{ d.chapter_to }} 章</span>
+          <span class="text-xs text-muted">第 {{ d.chapter_from }} 章</span>
         </div>
         <div v-if="d.characters?.length" class="flex flex-wrap gap-2 mt-3">
           <span
@@ -60,24 +60,15 @@
 
     <Modal v-model="createOpen" title="新建章节漫剧片段">
       <form @submit.prevent="add" class="space-y-4">
-        <p class="text-xs text-muted">为小说《{{ novelName || '当前小说' }}》选择连续章节生成漫剧素材。</p>
-        <div class="grid grid-cols-2 gap-3">
-          <div>
-            <label class="block text-sm text-app mb-1">起始章节</label>
-            <select v-model.number="form.chapter_from" class="w-full bg-surface border border-app rounded-[var(--radius-sm)] px-3 py-2 text-sm text-app outline-none focus:ring-2 ring-accent">
-              <option v-for="ch in chapterOptions" :key="'f'+ch.chapter_no" :value="ch.chapter_no">第 {{ ch.chapter_no }} 章 · {{ ch.title || '（无标题）' }}</option>
-            </select>
-          </div>
-          <div>
-            <label class="block text-sm text-app mb-1">结束章节</label>
-            <select v-model.number="form.chapter_to" class="w-full bg-surface border border-app rounded-[var(--radius-sm)] px-3 py-2 text-sm text-app outline-none focus:ring-2 ring-accent">
-              <option v-for="ch in chapterOptions" :key="'t'+ch.chapter_no" :value="ch.chapter_no">第 {{ ch.chapter_no }} 章 · {{ ch.title || '（无标题）' }}</option>
-            </select>
-          </div>
+        <p class="text-xs text-muted">为小说《{{ novelName || '当前小说' }}》选择一章生成单集漫剧素材。</p>
+        <div>
+          <label class="block text-sm text-app mb-1">选择章节</label>
+          <select v-model.number="form.chapter_no" class="w-full bg-surface border border-app rounded-[var(--radius-sm)] px-3 py-2 text-sm text-app outline-none focus:ring-2 ring-accent">
+            <option v-for="ch in chapterOptions" :key="'c'+ch.chapter_no" :value="ch.chapter_no">第 {{ ch.chapter_no }} 章 · {{ ch.title || '（无标题）' }}</option>
+          </select>
         </div>
-        <p v-if="spanError" class="text-xs text-danger">{{ spanError }}</p>
-        <p class="text-xs text-muted">摘要由系统根据所选章节与出场角色自动生成。</p>
-        <Input v-model="form.title" label="标题（可选）" placeholder="不填则自动生成「第x-y章」" />
+        <p class="text-xs text-muted">漫剧片段按单章制作，每次仅取一章；摘要由系统根据所选章节与出场角色自动生成。</p>
+        <Input v-model="form.title" label="标题（可选）" placeholder="不填则自动生成「第x章」" />
         <div class="flex justify-end gap-2">
           <Button variant="ghost" type="button" @click="createOpen = false">取消</Button>
           <Button type="submit" :loading="adding">创建</Button>
@@ -90,7 +81,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { PhTrash, PhFilmStrip } from '@phosphor-icons/vue'
 import Skeleton from '@/components/ui/Skeleton.vue'
@@ -116,16 +107,7 @@ const delOpen = ref(false)
 const pending = ref(null)
 const chapterOptions = ref([])
 const novelName = ref('')
-const form = ref({ chapter_from: null, chapter_to: null, title: '' })
-
-const spanError = computed(() => {
-  const a = Number(form.value.chapter_from)
-  const b = Number(form.value.chapter_to)
-  if (!a || !b) return ''
-  if (b < a) return '结束章节不能小于起始章节'
-  if (b - a + 1 > 5) return '章节范围不能超过 5 章'
-  return ''
-})
+const form = ref({ chapter_no: null, title: '' })
 
 onMounted(load)
 
@@ -154,26 +136,23 @@ function openCreate() {
     notify('该小说暂无章节，无法创建章节漫剧', 'error')
     return
   }
-  // 默认选前后两章（若存在），否则取第一/最后一章
+  // 默认选第一/最后一章，单章制作
   const first = opts[0]?.chapter_no
-  const second = opts[1]?.chapter_no ?? first
-  form.value = { chapter_from: first ?? null, chapter_to: second ?? null, title: '' }
+  form.value = { chapter_no: first ?? null, title: '' }
   createOpen.value = true
 }
 
 async function add() {
-  if (form.value.chapter_from == null || form.value.chapter_to == null) {
-    notify('请选择起始与结束章节', 'error')
-    return
-  }
-  if (spanError.value) {
-    notify(spanError.value, 'error')
+  if (form.value.chapter_no == null) {
+    notify('请选择章节', 'error')
     return
   }
   adding.value = true
+  const no = Number(form.value.chapter_no)
+  // 单章制作：起始与结束均为所选章节
   const res = await createChapterDrama(novelId, {
-    chapter_from: Number(form.value.chapter_from),
-    chapter_to: Number(form.value.chapter_to),
+    chapter_from: no,
+    chapter_to: no,
     title: form.value.title || null,
   })
   if (res.code === 0) {
