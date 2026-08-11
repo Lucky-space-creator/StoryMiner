@@ -18,12 +18,14 @@ database:
 # 注意：本机 Redis 为 3.2.100 老版本，需 redis-py 以 protocol=2 连接（见 redis_client.py）。
 # async_mode=false 表示默认回落串行队列（opt-in）；部署 celery worker 后改为 true。
 redis:
-  url: "redis://127.0.0.1:6363/0"
+  # 本机已启动的 Redis 运行在 6379（老版本 3.2.100，需 protocol=2，见 redis_client.py）。
+  # 若另行在 6363 启动 Redis，可改回 6363 或通过环境变量 REDIS_URL 覆盖。
+  url: "redis://127.0.0.1:6379/0"
   password: ""
 
 # 混合分析管道调度配置
 pipeline:
-  async_mode: false          # 置 true 启用 Celery 并行（需先启动 celery worker）
+  async_mode: true           # 启用 Celery 并行（celery worker 已启动；broker=6379 老 Redis）
   worker_concurrency: 8      # 每个 worker 进程并发执行任务数（建议 = CPU 核数）
 
 # 分析模式（极速 / 深度思考）：小说分析的两种入口

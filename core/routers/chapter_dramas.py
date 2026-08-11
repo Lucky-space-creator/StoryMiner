@@ -38,6 +38,7 @@ class SceneSaveIn(BaseModel):
     plot_arrangement: list[str] = []
     camera_movement: list[str] = []
     duration_estimate: str | None = None
+    prev_chapter_review: str | None = None
     content_raw: str | None = None
 
 
@@ -87,7 +88,7 @@ async def director_generate(
     user: User = Depends(get_current_user),
     session=Depends(get_session),
 ):
-    """导演 Agent 生成场景分析（M15.5）：返回四段式草稿，不落库。"""
+    """导演 Agent 生成场景分析（M15.5）：返回四段式结果并自动落库（生成即保存）。"""
     novel = await novel_repo.get_novel(session, user.id, novel_id)
     if not novel:
         raise BizError(404, "小说不存在")
@@ -95,6 +96,16 @@ async def director_generate(
     return success(data, "生成完成")
 
 
+@router.get("/{novel_id}/chapter-dramas/{drama_id}/director-status")
+async def director_status(
+    novel_id: int,
+    drama_id: int,
+    user: User = Depends(get_current_user),
+    session=Depends(get_session),
+):
+    """查询导演生成是否进行中（M15.5）：前端刷新后轮询以识别任务进行中并置灰按钮。"""
+    data = await drama_service.get_director_status(session, drama_id, user.id)
+    return success(data)
 @router.put("/{novel_id}/chapter-dramas/{drama_id}/scene")
 async def save_scene(
     novel_id: int,

@@ -31,6 +31,7 @@ class ChapterDramaScene(Base):
     drama_id: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True, index=True)
     owner_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
     novel_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    prev_chapter_review: Mapped[str | None] = mapped_column(Text, nullable=True, comment="上一章100-200字上集回顾（导演Agent生成，供本集衔接展示）")
     scene_design: Mapped[list] = mapped_column(JSONB, default=list, nullable=False)
     plot_arrangement: Mapped[list] = mapped_column(JSONB, default=list, nullable=False)
     camera_movement: Mapped[list] = mapped_column(JSONB, default=list, nullable=False)

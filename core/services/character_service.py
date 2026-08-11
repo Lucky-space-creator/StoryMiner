@@ -478,6 +478,10 @@ async def _analyze_candidates(session, novel_id, owner_id, full_text, cands, asy
         if existing:
             skipped += 1
             continue
+        # 需求3兜底：全书出场次数（jieba 词频 freq）< 10 不入库
+        if freq < 10:
+            skipped += 1
+            continue
         c_obj = Character(
             novel_id=novel_id, owner_id=owner_id, name=name,
             role=(item.get("role") or "配角").strip() or "配角",
@@ -610,7 +614,10 @@ async def analyze_and_create_characters(
             # 先 nlp 零成本产出人物候选与准确出现次数，再 LLM 逐候选精析小传；
             # 调用次数=候选数（远少于旧分片抽全类），落实「调用降 ≥50%」。
             # 启用 LangGraph 编排层（M7）时走状态图路径，否则走 M3 线性路径。
-            cands = nlp.extract_person_candidates(full_text, min_freq=2)
+            # 需求3：全书出场次数（jieba 词频 freq）< 10 的人物不入库。
+            # 这里把确定性候选层的 min_freq 直接提到 10，freq<10 的候选根本不进入精析，
+            # 从源头避免低频人物入库；_analyze_candidates 入库前再卡一次 freq<10 兜底。
+            cands = nlp.extract_person_candidates(full_text, min_freq=10)
             if cands and LANGGRAPH_ENABLED:
                 return await analyze_via_graph(session, novel_id, owner_id, full_text, cands, async_task_id)
             if cands:
@@ -673,6 +680,10 @@ async def analyze_and_create_characters(
                 # 同名人物跳过
                 existing = await character_repo.get_by_novel_name(session, novel_id, name)
                 if existing:
+                    skipped += 1
+                    continue
+                # 需求3兜底（回退分片路径无 jieba freq，用全书字符串出现次数近似）：<10 不入库
+                if full_text.count(name) < 10:
                     skipped += 1
                     continue
                 c = Character(

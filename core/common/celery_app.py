@@ -24,6 +24,16 @@ from celery import Celery
 
 from config import REDIS_URL, REDIS_PASSWORD, CELERY_WORKER_CONCURRENCY
 
+# 兼容约束：本机 Redis 为 3.2.100 老版本，redis-py 8.x 默认 RESP 协议为 3，
+# 老节点不识别 HELLO 命令会报 "unknown command 'HELLO'"。
+# celery/kombu 的 broker 连接未显式传 protocol，这里统一把本进程
+# redis 连接的默认协议版本降为 2（与 common/redis_client.py 的显式设置一致）。
+try:
+    import redis
+    redis.connection.DEFAULT_RESP_VERSION = 2
+except Exception:  # noqa: BLE001
+    pass
+
 # 构建 Celery app
 celery_app = Celery(
     "story_rag_pipeline",
