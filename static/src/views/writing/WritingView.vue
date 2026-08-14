@@ -90,6 +90,27 @@
         <div v-if="writing || writeText" class="mt-3 bg-surface2 border border-app rounded-[var(--radius-md)] p-3 text-sm text-app whitespace-pre-wrap leading-relaxed min-h-[6rem]">
           {{ writeText }}<span v-if="writing" class="animate-pulse">▍</span>
         </div>
+
+        <!-- 用户编辑并保存到 MinIO（M8.9） -->
+        <div v-if="writeText" class="mt-3 border-t border-app pt-3">
+          <div class="flex items-center justify-between mb-2">
+            <h4 class="text-sm font-medium text-app">编辑并保存到 MinIO</h4>
+            <div class="flex items-center gap-2">
+              <input
+                v-model="saveName"
+                placeholder="文件名（可选）"
+                class="bg-surface border border-app rounded-[var(--radius-sm)] px-2 py-1 text-xs text-app outline-none focus:ring-2 ring-accent w-32"
+              />
+              <Button size="sm" :loading="saving" @click="saveContinue">保存到 MinIO</Button>
+            </div>
+          </div>
+          <textarea
+            v-model="editText"
+            rows="6"
+            placeholder="可在此修改续写内容后保存…"
+            class="w-full bg-surface2 border border-app rounded-[var(--radius-md)] px-3 py-2 text-sm text-app outline-none focus:ring-2 ring-accent resize-y"
+          ></textarea>
+        </div>
       </Card>
 
       <!-- 续写版本（M8.6/M8.7） -->
@@ -117,6 +138,32 @@
           </li>
         </ul>
       </Card>
+
+      <!-- 已保存续写（MinIO，M8.9） -->
+      <Card>
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="font-medium text-app">已保存续写（MinIO）</h3>
+          <Button variant="secondary" size="sm" :loading="savedLoading" @click="loadSaved">刷新</Button>
+        </div>
+        <p v-if="!savedList.length" class="text-sm text-muted">暂无保存到 MinIO 的续写草稿。</p>
+        <ul v-else class="space-y-2 max-h-72 overflow-auto">
+          <li
+            v-for="s in savedList"
+            :key="s.object_key"
+            class="bg-surface2 border border-app rounded-[var(--radius-md)] p-3"
+          >
+            <div class="flex items-start justify-between gap-2">
+              <div class="min-w-0">
+                <p class="text-sm text-app font-medium truncate">{{ s.name }}</p>
+                <p class="text-xs text-muted">
+                  {{ s.size }} 字节 · {{ s.last_modified || '未知时间' }}
+                </p>
+              </div>
+              <Button variant="secondary" size="sm" @click="openSaved(s)">查看/载入</Button>
+            </div>
+          </li>
+        </ul>
+      </Card>
     </div>
   </div>
 </template>
@@ -133,6 +180,9 @@ import {
   listVersions,
   adoptVersion,
   openWriteSocket,
+  saveContinueWrite,
+  listSavedContinues,
+  readSavedContinue,
 } from '@/api/writing'
 import { listNovels } from '@/api/novels'
 
@@ -161,6 +211,13 @@ const versions = ref([])
 const versionLoading = ref(false)
 const adopting = ref(0)
 
+// 编辑保存（M8.9）
+const editText = ref('')
+const saveName = ref('')
+const saving = ref(false)
+const savedList = ref([])
+const savedLoading = ref(false)
+
 function styleLabel(s) {
   return { original: '原风格', tense: '悬疑', warm: '温情' }[s] || s
 }
@@ -176,6 +233,7 @@ onMounted(async () => {
   novels.value = res.data?.list || []
   if (novels.value[0]) novelId.value = novels.value[0].id
   await loadVersions()
+  await loadSaved()
 })
 
 onUnmounted(() => closeWriteSocket())
@@ -222,7 +280,9 @@ async function onNovelChange() {
   timelineText.value = ''
   arcText.value = ''
   writeText.value = ''
+  editText.value = ''
   await loadVersions()
+  await loadSaved()
 }
 
 function runWrite() {
@@ -242,6 +302,7 @@ function runWrite() {
       writeText.value += data.content
     } else if (data.type === 'done') {
       writing.value = false
+      editText.value = writeText.value
       await loadVersions()
     } else if (data.type === 'error') {
       writeText.value += '\n[出错] ' + (data.content || '')
@@ -277,6 +338,44 @@ async function adopt(versionId) {
     await loadVersions()
   } finally {
     adopting.value = 0
+  }
+}
+
+// 编辑后保存到 MinIO（M8.9）
+async function saveContinue() {
+  if (!editText.value.trim() || saving.value) return
+  saving.value = true
+  try {
+    const res = await saveContinueWrite(novelId.value, editText.value, saveName.value || null)
+    await loadSaved()
+    alert('已保存到 MinIO：' + (res.data?.name || saveName.value))
+  } catch (e) {
+    alert('保存失败：' + (e?.response?.data?.msg || e.message))
+  } finally {
+    saving.value = false
+  }
+}
+
+// 加载已保存的续写草稿列表
+async function loadSaved() {
+  savedLoading.value = true
+  try {
+    const res = await listSavedContinues(novelId.value)
+    savedList.value = res.data?.items || []
+  } finally {
+    savedLoading.value = false
+  }
+}
+
+// 查看/载入某份已保存草稿
+async function openSaved(item) {
+  try {
+    const res = await readSavedContinue(novelId.value, item.object_key)
+    editText.value = res.data?.content || ''
+    saveName.value = item.name
+    alert('已载入：' + item.name)
+  } catch (e) {
+    alert('读取失败：' + (e?.response?.data?.msg || e.message))
   }
 }
 </script>

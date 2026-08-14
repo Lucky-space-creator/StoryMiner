@@ -266,3 +266,80 @@ async def adopt_as_chapter(session: AsyncSession, owner_id: int, version_id: int
         "chapter_no": next_no,
         "title": new_chapter.title,
     }
+
+
+# ─────────────────────────────────────────────────────────────
+# 用户编辑保存（M8.9）：用户在前端修改续写内容后，保存到 MinIO 新文件夹
+# 对象键前缀固定为 continue_write/{owner_id}/{novel_id}/，实现「新建一个文件夹存放续写内容」
+# ─────────────────────────────────────────────────────────────
+def _continue_write_key(owner_id: int, novel_id: int, name: str) -> str:
+    """生成续写保存对象键：continue_write/{owner}/{novel}/{name}.txt。"""
+    safe = "".join(c for c in name if c.isalnum() or c in "-_")
+    return f"continue_write/{owner_id}/{novel_id}/{safe or 'untitled'}.txt"
+
+
+async def save_continue_write(
+    session: AsyncSession,
+    owner_id: int,
+    novel_id: int,
+    content: str,
+    name: str | None = None,
+) -> dict:
+    """保存用户编辑后的续写内容到 MinIO（新建 continue_write 目录）。
+
+    整体思路：纯存储动作，不改动数据库版本；用户可多次保存不同 name 形成多份草稿。
+    关键点：name 经安全化防目录穿越；内容以 UTF-8 写入 MinIO，返回可回读的对象键。
+    """
+    from storage import minio_storage
+
+    name = name or f"续写_{int(__import__('time').time())}"
+    key = _continue_write_key(owner_id, novel_id, name)
+    data = content.encode("utf-8")
+    digest = minio_storage.sha256(data)
+    # 直接以规范键 put 到 MinIO（continue_write 前缀目录），保证路径稳定、可回列可读
+    await minio_storage.ensure_storage()
+    import io as _io
+    minio_storage._client.put_object(
+        minio_storage.MINIO_BUCKET, key, _io.BytesIO(data), length=len(data)
+    )
+    return {
+        "object_key": key,
+        "name": name,
+        "length": len(data),
+        "digest": digest,
+    }
+
+
+async def list_continue_writes(session: AsyncSession, owner_id: int, novel_id: int) -> list[dict]:
+    """列出某小说下用户保存的续写草稿（从 MinIO 按前缀列举）。"""
+    from minio import Minio
+    from config import MINIO_BUCKET
+    from storage import minio_storage
+
+    prefix = f"continue_write/{owner_id}/{novel_id}/"
+    client: Minio = minio_storage._client
+    items = []
+    try:
+        for obj in client.list_objects(MINIO_BUCKET, prefix=prefix, recursive=True):
+            if not obj.object_name.endswith(".txt"):
+                continue
+            nm = obj.object_name.rsplit("/", 1)[-1][:-4]
+            items.append({
+                "name": nm,
+                "object_key": obj.object_name,
+                "size": obj.size,
+                "last_modified": obj.last_modified.isoformat() if obj.last_modified else None,
+            })
+    except Exception:
+        pass
+    return items
+
+
+async def read_continue_write(session: AsyncSession, owner_id: int, object_key: str) -> str:
+    """回读某份续写草稿内容。"""
+    from storage import minio_storage
+
+    if not object_key.startswith(f"continue_write/{owner_id}/"):
+        raise BizError(403, "无权访问该续写文件")
+    data = await minio_storage.read(object_key)
+    return data.decode("utf-8", errors="replace")
