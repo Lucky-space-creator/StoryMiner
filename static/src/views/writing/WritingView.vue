@@ -18,7 +18,13 @@
       <Card>
         <div class="flex items-center justify-between mb-3">
           <h3 class="font-medium text-app">情节概览</h3>
-          <Button variant="secondary" :loading="summaryLoading" @click="runSummary">生成概览</Button>
+          <div class="flex items-center gap-2">
+            <select v-model="summaryDetail" class="bg-surface border border-app rounded-[var(--radius-sm)] px-2 py-1.5 text-xs text-app">
+              <option value="brief">简要</option>
+              <option value="detail">详细</option>
+            </select>
+            <Button variant="secondary" size="sm" :loading="summaryLoading" @click="runSummary">生成/重生成</Button>
+          </div>
         </div>
         <div v-if="summaryLoading" class="space-y-2">
           <Skeleton h="0.875rem" w="90%" />
@@ -26,13 +32,19 @@
           <Skeleton h="0.875rem" w="85%" />
         </div>
         <p v-else-if="summaryText" class="text-sm text-app whitespace-pre-wrap leading-relaxed">{{ summaryText }}</p>
-        <p v-else class="text-sm text-muted">点击「生成概览」按章/卷梳理情节。</p>
+        <p v-else class="text-sm text-muted">选择详略后点击「生成/重生成」按章/卷梳理情节（已生成结果会自动缓存）。</p>
       </Card>
 
       <Card>
         <div class="flex items-center justify-between mb-3">
           <h3 class="font-medium text-app">时间线</h3>
-          <Button variant="secondary" :loading="timelineLoading" @click="runTimeline">梳理时间线</Button>
+          <div class="flex items-center gap-2">
+            <select v-model="timelineDetail" class="bg-surface border border-app rounded-[var(--radius-sm)] px-2 py-1.5 text-xs text-app">
+              <option value="brief">简要</option>
+              <option value="detail">详细</option>
+            </select>
+            <Button variant="secondary" size="sm" :loading="timelineLoading" @click="runTimeline">生成/重生成</Button>
+          </div>
         </div>
         <div v-if="timelineLoading" class="space-y-2">
           <Skeleton h="0.875rem" w="90%" />
@@ -40,13 +52,19 @@
           <Skeleton h="0.875rem" w="85%" />
         </div>
         <p v-else-if="timelineText" class="text-sm text-app whitespace-pre-wrap leading-relaxed">{{ timelineText }}</p>
-        <p v-else class="text-sm text-muted">点击「梳理时间线」提取事件时间轴。</p>
+        <p v-else class="text-sm text-muted">选择详略后点击「生成/重生成」提取事件时间轴（已生成结果会自动缓存）。</p>
       </Card>
 
       <Card>
         <div class="flex items-center justify-between mb-3">
           <h3 class="font-medium text-app">角色弧线</h3>
-          <Button variant="secondary" :loading="arcLoading" @click="runArc">生成弧线</Button>
+          <div class="flex items-center gap-2">
+            <select v-model="arcDetail" class="bg-surface border border-app rounded-[var(--radius-sm)] px-2 py-1.5 text-xs text-app">
+              <option value="brief">简要</option>
+              <option value="detail">详细</option>
+            </select>
+            <Button variant="secondary" size="sm" :loading="arcLoading" @click="runArc">生成/重生成</Button>
+          </div>
         </div>
         <div v-if="arcLoading" class="space-y-2">
           <Skeleton h="0.875rem" w="90%" />
@@ -54,7 +72,7 @@
           <Skeleton h="0.875rem" w="85%" />
         </div>
         <p v-else-if="arcText" class="text-sm text-app whitespace-pre-wrap leading-relaxed">{{ arcText }}</p>
-        <p v-else class="text-sm text-muted">点击「生成弧线」概览主要人物成长轨迹。</p>
+        <p v-else class="text-sm text-muted">选择详略后点击「生成/重生成」概览主要人物成长轨迹（已生成结果会自动缓存）。</p>
       </Card>
     </div>
 
@@ -70,7 +88,7 @@
           placeholder="输入续写上下文或提示词…"
           class="w-full bg-surface2 border border-app rounded-[var(--radius-md)] px-3 py-2 text-sm text-app outline-none focus:ring-2 ring-accent resize-none"
         ></textarea>
-        <div class="flex flex-wrap gap-3 mt-3">
+        <div class="flex flex-wrap items-center gap-3 mt-3">
           <select v-model="style" class="bg-surface border border-app rounded-[var(--radius-sm)] px-2 py-1.5 text-sm text-app">
             <option value="original">贴合原风格</option>
             <option value="tense">紧张悬疑</option>
@@ -85,6 +103,14 @@
             <option value="third">第三人称</option>
             <option value="first">第一人称</option>
           </select>
+          <select v-model="chapterId" class="bg-surface border border-app rounded-[var(--radius-sm)] px-2 py-1.5 text-sm text-app">
+            <option :value="null">续最新章</option>
+            <option v-for="c in chapters" :key="c.id" :value="c.id">第{{ c.chapter_no }}章 {{ c.title || '' }}</option>
+          </select>
+          <label class="flex items-center gap-1.5 text-sm text-app">
+            <input type="checkbox" v-model="useChars" class="accent-[var(--accent)]" />
+            结合人物设定
+          </label>
           <Button class="ml-auto" :loading="writing" @click="runWrite">生成续写</Button>
         </div>
         <div v-if="writing || writeText" class="mt-3 bg-surface2 border border-app rounded-[var(--radius-md)] p-3 text-sm text-app whitespace-pre-wrap leading-relaxed min-h-[6rem]">
@@ -177,6 +203,8 @@ import {
   generateSummary,
   generateTimeline,
   generateCharacterArc,
+  getAnalysisCached,
+  getAnalysesCacheds,
   listVersions,
   adoptVersion,
   openWriteSocket,
@@ -185,26 +213,35 @@ import {
   readSavedContinue,
 } from '@/api/writing'
 import { listNovels } from '@/api/novels'
+import { listChapters } from '@/api/characters'
 
 const novels = ref([])
 const novelId = ref(1)
 
-// 概览 / 时间线 / 角色弧线
+// 概览 / 时间线 / 角色弧线 + 详略档位
 const summaryLoading = ref(false)
 const summaryText = ref('')
+const summaryDetail = ref('brief')
 const timelineLoading = ref(false)
 const timelineText = ref('')
+const timelineDetail = ref('brief')
 const arcLoading = ref(false)
 const arcText = ref('')
+const arcDetail = ref('brief')
 
 // 续写
 const prompt = ref('')
 const style = ref('original')
 const length = ref('mid')
 const pov = ref('third')
+const chapterId = ref(null)
+const useChars = ref(false)
 const writing = ref(false)
 const writeText = ref('')
 const writeSocket = ref(null)
+
+// 章节列表（续写「基于章节」下拉）
+const chapters = ref([])
 
 // 版本
 const versions = ref([])
@@ -232,6 +269,8 @@ onMounted(async () => {
   const res = await listNovels()
   novels.value = res.data?.list || []
   if (novels.value[0]) novelId.value = novels.value[0].id
+  await loadChapters()
+  await loadCacheds()
   await loadVersions()
   await loadSaved()
 })
@@ -245,10 +284,36 @@ function closeWriteSocket() {
   }
 }
 
+// 加载章节列表（续写「基于章节」下拉）
+async function loadChapters() {
+  try {
+    const res = await listChapters(novelId.value, 1, 200)
+    const d = res.data || {}
+    chapters.value = d.list || d.items || []
+  } catch {
+    chapters.value = []
+  }
+}
+
+// 读取该小说已缓存的概览结果并直接展示（避免重复生成）
+async function loadCacheds() {
+  try {
+    const res = await getAnalysesCacheds(novelId.value)
+    const items = res.data?.items || []
+    for (const it of items) {
+      if (it.kind === 'summary') { summaryText.value = it.content; summaryDetail.value = it.detail || 'brief' }
+      else if (it.kind === 'timeline') { timelineText.value = it.content; timelineDetail.value = it.detail || 'brief' }
+      else if (it.kind === 'character_arc') { arcText.value = it.content; arcDetail.value = it.detail || 'brief' }
+    }
+  } catch {
+    // 读取失败不影响手动生成
+  }
+}
+
 async function runSummary() {
   summaryLoading.value = true
   try {
-    const res = await generateSummary(novelId.value)
+    const res = await generateSummary(novelId.value, { detail: summaryDetail.value })
     summaryText.value = res.data?.text || ''
   } finally {
     summaryLoading.value = false
@@ -258,7 +323,7 @@ async function runSummary() {
 async function runTimeline() {
   timelineLoading.value = true
   try {
-    const res = await generateTimeline(novelId.value)
+    const res = await generateTimeline(novelId.value, { detail: timelineDetail.value })
     timelineText.value = res.data?.text || ''
   } finally {
     timelineLoading.value = false
@@ -268,7 +333,7 @@ async function runTimeline() {
 async function runArc() {
   arcLoading.value = true
   try {
-    const res = await generateCharacterArc(novelId.value)
+    const res = await generateCharacterArc(novelId.value, { detail: arcDetail.value })
     arcText.value = res.data?.text || ''
   } finally {
     arcLoading.value = false
@@ -281,6 +346,9 @@ async function onNovelChange() {
   arcText.value = ''
   writeText.value = ''
   editText.value = ''
+  chapterId.value = null
+  await loadChapters()
+  await loadCacheds()
   await loadVersions()
   await loadSaved()
 }
@@ -312,11 +380,12 @@ function runWrite() {
   sock.onopen = () => {
     sock.send(JSON.stringify({
       type: 'continue',
-      chapter_id: null,
+      chapter_id: chapterId.value || null,
       prompt: prompt.value,
       style: style.value,
       length: length.value,
       perspective: pov.value,
+      use_chars: useChars.value,
     }))
   }
 }

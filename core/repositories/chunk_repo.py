@@ -65,7 +65,7 @@ async def list_chunks(session, owner_id, kb_id=None, chapter_id=None, disabled=N
         cond.append(Chunk.disabled == disabled)
     total = (await session.execute(select(func.count()).select_from(Chunk).where(*cond))).scalar_one()
     rows = (await session.execute(
-        select(Chunk).where(*cond).order_by(Chunk.id.desc()).offset((page - 1) * size).limit(size)
+        select(Chunk).where(*cond).order_by(Chunk.id.asc()).offset((page - 1) * size).limit(size)
     )).scalars().all()
     return rows, total
 
@@ -83,7 +83,7 @@ async def search_chunks(session, owner_id, q, page=1, size=20):
     cond = [Chunk.owner_id == owner_id, Chunk.content.ilike(f"%{q}%")]
     total = (await session.execute(select(func.count()).select_from(Chunk).where(*cond))).scalar_one()
     rows = (await session.execute(
-        select(Chunk).where(*cond).order_by(Chunk.id.desc()).offset((page - 1) * size).limit(size)
+        select(Chunk).where(*cond).order_by(Chunk.id.asc()).offset((page - 1) * size).limit(size)
     )).scalars().all()
     return rows, total
 

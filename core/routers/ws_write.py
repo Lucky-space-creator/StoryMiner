@@ -56,6 +56,7 @@ async def write_ws(websocket: WebSocket, novel_id: int, token: str = Query(...))
                 "style": msg.get("style", "original"),
                 "length": msg.get("length", "mid"),
                 "perspective": msg.get("perspective", "third"),
+                "use_chars": msg.get("use_chars", False),
                 "title": msg.get("title"),
             }
             try:

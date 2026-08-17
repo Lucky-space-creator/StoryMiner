@@ -36,9 +36,11 @@ export function useTaskSSE() {
     } catch {
       return
     }
-    // 全量快照：连接建立时一次性推送
+    // 全量快照：连接建立时一次性推送。按 id 降序（最近的在前）插入，
+    // 保证右下角悬浮窗倒序展示；逐条 unshift 会因后端返回顺序而错位，故先排序。
     if (payload.type === 'snapshot') {
-      for (const t of payload.tasks || []) {
+      const snap = [...(payload.tasks || [])].sort((a, b) => (b.id || 0) - (a.id || 0))
+      for (const t of snap) {
         upsertTask(t)
         knownIds.add(t.id)
       }

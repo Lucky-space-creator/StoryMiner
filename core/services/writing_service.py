@@ -23,28 +23,15 @@ from repositories import novel_repo, character_repo, writing_repo, llm_repo
 from llm import langchain_factory as llm_adapters
 from common import crypto
 from common.exceptions import BizError
+from prompts import (
+    build_summary_prompt, build_timeline_prompt, build_character_arc_prompt, build_continue_system,
+)
 
 
 # 续写前文取末尾片段字数上限
 CONTEXT_CHARS = 1500
 # 概览/时间线拼接正文总字数上限
 SUMMARY_CHARS = 8000
-
-# 风格 / 长度 / 视角 中文描述映射（M8.5）
-_STYLE_DESC = {
-    "original": "贴合原作风格，保持既有叙事语气",
-    "tense": "紧张悬疑，节奏紧凑，制造悬念",
-    "warm": "温情舒缓，细腻柔和",
-}
-_LENGTH_DESC = {
-    "short": "约200字",
-    "mid": "约500字",
-    "long": "约1000字",
-}
-_POV_DESC = {
-    "third": "第三人称（全知或限知）视角",
-    "first": "第一人称视角",
-}
 
 
 # ---------------------------------------------------------------------------
@@ -102,47 +89,34 @@ async def _build_context(session: AsyncSession, novel_id: int, chapter_id: int |
 # ---------------------------------------------------------------------------
 # 一次性生成：概览 / 时间线 / 角色弧线（M8.1/M8.2/M8.3）
 # ---------------------------------------------------------------------------
-async def generate_summary(session: AsyncSession, owner_id: int, novel_id: int) -> str:
-    """生成情节概览（M8.1）：按章/卷梳理故事线摘要。"""
+async def generate_summary(session: AsyncSession, owner_id: int, novel_id: int, detail: str = "brief") -> str:
+    """生成情节概览（M8.1）：按章/卷梳理故事线摘要，结果按 (kind,detail) 覆盖落库缓存。"""
     novel = await _load_novel(session, owner_id, novel_id)
     text = await _collect_chapters_text(session, novel_id, SUMMARY_CHARS)
     if not text:
         raise BizError(400, "该小说暂无正文，无法生成概览")
     adapter = await _get_chat_adapter(session, owner_id)
-    messages = [{
-        "role": "user",
-        "content": (
-            f"你是一位资深小说编辑。请阅读小说《{novel.name}》的章节内容，生成一份【情节概览】。\n"
-            "要求：按章节/卷梳理故事线，提炼每条情节的核心事件与推进，语言简练、有层次。\n"
-            f"=== 正文（节选）===\n{text}\n=== 结束 ===\n"
-            "请直接输出概览，使用 Markdown 列表或分段，不要添加多余解释。"
-        ),
-    }]
-    return await adapter.chat(messages)
+    messages = [{"role": "user", "content": build_summary_prompt(novel.name, text, detail)}]
+    result = await adapter.chat(messages)
+    await writing_repo.save_analysis(session, owner_id, novel_id, "summary", detail, result)
+    return result
 
 
-async def generate_timeline(session: AsyncSession, owner_id: int, novel_id: int) -> str:
-    """生成时间线梳理（M8.2）：提取事件时间轴并纠正乱序。"""
+async def generate_timeline(session: AsyncSession, owner_id: int, novel_id: int, detail: str = "brief") -> str:
+    """生成时间线梳理（M8.2）：提取事件时间轴并纠正乱序，结果落库缓存。"""
     novel = await _load_novel(session, owner_id, novel_id)
     text = await _collect_chapters_text(session, novel_id, SUMMARY_CHARS)
     if not text:
         raise BizError(400, "该小说暂无正文，无法生成时间线")
     adapter = await _get_chat_adapter(session, owner_id)
-    messages = [{
-        "role": "user",
-        "content": (
-            f"请基于小说《{novel.name}》正文，提取关键事件并梳理成【时间线】。\n"
-            "要求：按事件发生的时间顺序排列；若原文存在时间乱序请纠正并标注；"
-            "每条事件用一句话概括，可附章节出处。\n"
-            f"=== 正文（节选）===\n{text}\n=== 结束 ===\n"
-            "直接输出时间线（时间 → 事件 的列表形式），不要添加多余解释。"
-        ),
-    }]
-    return await adapter.chat(messages)
+    messages = [{"role": "user", "content": build_timeline_prompt(novel.name, text, detail)}]
+    result = await adapter.chat(messages)
+    await writing_repo.save_analysis(session, owner_id, novel_id, "timeline", detail, result)
+    return result
 
 
-async def generate_character_arc(session: AsyncSession, owner_id: int, novel_id: int) -> str:
-    """生成角色弧线概览（M8.3）：主要人物成长/变化轨迹。"""
+async def generate_character_arc(session: AsyncSession, owner_id: int, novel_id: int, detail: str = "brief") -> str:
+    """生成角色弧线概览（M8.3）：主要人物成长/变化轨迹，结果落库缓存。"""
     novel = await _load_novel(session, owner_id, novel_id)
     chars = await character_repo.list_by_novel(session, novel_id)
     if not chars:
@@ -155,16 +129,29 @@ async def generate_character_arc(session: AsyncSession, owner_id: int, novel_id:
         for c in chars
     )
     adapter = await _get_chat_adapter(session, owner_id)
-    messages = [{
-        "role": "user",
-        "content": (
-            f"以下是小说《{novel.name}》的主要人物档案：\n{chars_text}\n\n"
-            "请结合上述人物，生成【角色弧线概览】：概述每位主要人物的成长/变化轨迹"
-            "（起点状态 → 关键转折 → 当前状态）。\n"
-            "直接输出，按人物分小节，不要添加多余解释。"
-        ),
-    }]
-    return await adapter.chat(messages)
+    messages = [{"role": "user", "content": build_character_arc_prompt(novel.name, chars_text, detail)}]
+    result = await adapter.chat(messages)
+    await writing_repo.save_analysis(session, owner_id, novel_id, "character_arc", detail, result)
+    return result
+
+
+async def get_cached_analysis(
+    session: AsyncSession, owner_id: int, novel_id: int, kind: str, detail: str = "brief"
+) -> dict | None:
+    """读取已缓存的概览类分析结果（M8 缓存复用）；无则返回 None，由前端触发生成。"""
+    row = await writing_repo.get_analysis(session, owner_id, novel_id, kind, detail)
+    if not row:
+        return None
+    return {"kind": kind, "detail": detail, "content": row.content, "word_count": row.word_count}
+
+
+async def get_cached_analyses(session: AsyncSession, owner_id: int, novel_id: int) -> list[dict]:
+    """批量读取某小说全部已缓存概览（前端初始化直接展示，避免重复生成）。"""
+    rows = await writing_repo.get_analyses_by_novel(session, owner_id, novel_id)
+    return [
+        {"kind": r.kind, "detail": r.detail, "content": r.content, "word_count": r.word_count}
+        for r in rows
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -180,21 +167,27 @@ async def stream_continue(
     pov = payload.get("perspective", "third")
     prompt = (payload.get("prompt") or "").strip()
     chapter_id = payload.get("chapter_id")
+    use_chars = bool(payload.get("use_chars", False))
 
     context = await _build_context(session, novel_id, chapter_id)
     adapter = await _get_chat_adapter(session, owner_id)
 
-    system = (
-        "你是一位小说续写助手。请根据【前文】与【创作要求】继续创作后续情节。\n"
-        f"【前文】（末尾片段）：\n{context}\n"
-        f"【用户提示】：{prompt or '（无，请自然延续）'}\n"
-        "【创作要求】：\n"
-        f"- 文风：{_STYLE_DESC.get(style, _STYLE_DESC['original'])}\n"
-        f"- 篇幅：{_LENGTH_DESC.get(length, _LENGTH_DESC['mid'])}\n"
-        f"- 视角：{_POV_DESC.get(pov, _POV_DESC['third'])}\n"
-        "- 严格延续前文的人物、世界观与叙事节奏；不要重复前文结尾，自然衔接展开。\n"
-        "直接输出续写正文，不要加任何解释、标题或前缀。"
-    )
+    # 结合人物设定：注入该小说人物档案，使续写更贴合角色性格与关系
+    char_block = ""
+    if use_chars:
+        try:
+            chars = await character_repo.list_by_novel(session, novel_id)
+            if chars:
+                char_block = "\n\n【人物设定参考】（请严格贴合以下角色性格/关系创作）：\n" + "\n".join(
+                    f"- {c.name}"
+                    + (f"（{c.identity}）" if c.identity else "")
+                    + (f"：{c.personality}" if c.personality else "")
+                    for c in chars
+                )
+        except Exception:
+            char_block = ""
+
+    system = build_continue_system(context, prompt, style, length, pov, char_block)
     # 注入启用的续写 Skill 附加指令（M10.4）：挂载点 continue_write 或 global 的启用项
     try:
         from services import skill_service

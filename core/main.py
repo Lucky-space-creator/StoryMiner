@@ -144,6 +144,24 @@ async def lifespan(app: FastAPI):
             ))
         except Exception:
             pass
+        # V20：续写概览分析缓存表（story_writing_analysis）。create_all 已能自动建新表，
+        # 此处追加幂等建表以兼容未跑 create_all 的环境，缺失会导致 GET 缓存接口 500。
+        try:
+            from sqlalchemy import text
+            await conn.execute(text(
+                "CREATE TABLE IF NOT EXISTS story_writing_analysis ("
+                "id BIGSERIAL PRIMARY KEY, owner_id BIGINT NOT NULL, novel_id BIGINT NOT NULL, "
+                "kind VARCHAR(20) NOT NULL, detail VARCHAR(10) NOT NULL DEFAULT 'brief', "
+                "content TEXT NOT NULL DEFAULT '', word_count INTEGER NOT NULL DEFAULT 0, "
+                "created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+                "CONSTRAINT uq_writing_analysis_key UNIQUE (owner_id, novel_id, kind, detail))"
+            ))
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_writing_analysis_novel "
+                "ON story_writing_analysis (novel_id, owner_id)"
+            ))
+        except Exception:
+            pass
         # 清理上次进程遗留的僵尸任务：内存队列随重启清空，DB 中残留的 running/pending
         # 任务不会再被执行，标记为 failed，避免前端一直显示「进行中/排队中」。
         try:

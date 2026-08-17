@@ -7,10 +7,12 @@ export const useTaskProgressStore = defineStore('taskProgress', {
     visible: false
   }),
   actions: {
+    // 新任务插入到列表头部（最新在上），已有任务原地更新；
+    // 保证右下角「解析进度」悬浮窗按时间倒序展示（最近的在前）。
     upsert(task) {
       const idx = this.tasks.findIndex((t) => t.id === task.id)
       if (idx >= 0) this.tasks[idx] = { ...this.tasks[idx], ...task }
-      else this.tasks.push(task)
+      else this.tasks.unshift(task)
     },
     remove(id) {
       this.tasks = this.tasks.filter((t) => t.id !== id)

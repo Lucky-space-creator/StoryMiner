@@ -15,6 +15,7 @@ from sqlalchemy import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.story_writing import ContinueWrite
+from models.writing_analysis import WritingAnalysis
 
 
 async def save_version(session: AsyncSession, obj: ContinueWrite) -> ContinueWrite:
@@ -45,3 +46,59 @@ async def get_version(session: AsyncSession, owner_id: int, version_id: int) -> 
     if not obj or obj.owner_id != owner_id or obj.deleted_at is not None:
         return None
     return obj
+
+
+# ---------------------------------------------------------------------------
+# 概览类分析结果缓存（M8 缓存复用，按 novel+kind+detail 各存一份最新）
+# ---------------------------------------------------------------------------
+async def save_analysis(
+    session: AsyncSession, owner_id: int, novel_id: int,
+    kind: str, detail: str, content: str,
+) -> WritingAnalysis:
+    """覆盖式保存一份概览类分析结果（幂等 upsert）。
+
+    整体思路：按唯一键 (owner_id, novel_id, kind, detail) 定位旧记录并覆盖，
+        不存在则新建；保证每类每档只保留最新一份，打开即读缓存避免重复 LLM。
+    关键点：先查后写，复用 ORM 实例以触发 UPDATE 而非 INSERT 冲突。
+    """
+    stmt = select(WritingAnalysis).where(
+        WritingAnalysis.owner_id == owner_id,
+        WritingAnalysis.novel_id == novel_id,
+        WritingAnalysis.kind == kind,
+        WritingAnalysis.detail == detail,
+    )
+    obj = (await session.execute(stmt)).scalars().first()
+    if obj is None:
+        obj = WritingAnalysis(
+            owner_id=owner_id, novel_id=novel_id, kind=kind, detail=detail
+        )
+        session.add(obj)
+    obj.content = content
+    obj.word_count = len(content.strip())
+    await session.flush()
+    await session.refresh(obj)
+    return obj
+
+
+async def get_analysis(
+    session: AsyncSession, owner_id: int, novel_id: int, kind: str, detail: str
+) -> WritingAnalysis | None:
+    """读取一份已缓存的概览类分析结果（无则返回 None）。"""
+    stmt = select(WritingAnalysis).where(
+        WritingAnalysis.owner_id == owner_id,
+        WritingAnalysis.novel_id == novel_id,
+        WritingAnalysis.kind == kind,
+        WritingAnalysis.detail == detail,
+    )
+    return (await session.execute(stmt)).scalars().first()
+
+
+async def get_analyses_by_novel(
+    session: AsyncSession, owner_id: int, novel_id: int
+) -> list[WritingAnalysis]:
+    """读取某小说下全部已缓存的概览类分析结果（前端初始化批量载入）。"""
+    stmt = select(WritingAnalysis).where(
+        WritingAnalysis.owner_id == owner_id,
+        WritingAnalysis.novel_id == novel_id,
+    )
+    return list((await session.execute(stmt)).scalars().all())

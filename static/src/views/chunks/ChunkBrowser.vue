@@ -143,7 +143,7 @@ const size = ref(20)
 const total = ref(0)
 
 const columns = [
-  { key: 'id', label: 'ID' },
+  { key: 'seq', label: '序号' },
   { key: 'kb_name', label: '知识库' },
   { key: 'chapter', label: '章节' },
   { key: 'content', label: '内容' },

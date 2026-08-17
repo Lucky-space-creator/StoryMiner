@@ -2,12 +2,14 @@
 续写与概览 REST 路由（M8 情节概览与续写）
 
 整体思路：
-    暴露概览/时间线/角色弧线（一次性生成）、续写版本列表、采纳为新章节等 REST 接口（前缀 /api/v1）；
-    续写的流式生成走独立 WebSocket（见 routers/ws_write.py），本路由只负责非流式的元数据与版本管理。
+    暴露概览/时间线/角色弧线（一次性生成，结果按 kind+detail 覆盖落库缓存）、续写版本列表、
+    采纳为新章节等 REST 接口（前缀 /api/v1）；续写的流式生成走独立 WebSocket（见 routers/ws_write.py），
+    本路由只负责非流式的元数据、版本管理与分析缓存读取。
 
 关键点：
     1. 全部依赖 get_current_user 获得 owner_id，保证多用户命名空间隔离。
-    2. 概览/时间线/角色弧线为实时 LLM 生成，不落库，直接返回文本。
+    2. 概览/时间线/角色弧线：生成时按 (kind, detail) 覆盖缓存；GET 读缓存接口供前端「打开即展示」，
+       避免重复调用 LLM 浪费资源；force=true 可强制重新生成。
     3. 采纳接口将已有续写版本写为新章节，复用 M1 的 Chapter 模型。
 
 实现逻辑：
@@ -32,37 +34,76 @@ class AdoptReq(BaseModel):
     version_id: int
 
 
+class AnalysisReq(BaseModel):
+    """概览类生成请求体：详略程度（brief/detail）。"""
+
+    detail: str = "brief"
+
+
 @router.post("/{novel_id}/summary")
 async def summary(
     novel_id: int,
+    req: AnalysisReq | None = None,
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
-    """生成情节概览（M8.1）。"""
-    text = await writing_service.generate_summary(session, user.id, novel_id)
+    """生成情节概览（M8.1），结果按 (kind,detail) 覆盖缓存。"""
+    detail = (req.detail if req else "brief") or "brief"
+    text = await writing_service.generate_summary(session, user.id, novel_id, detail)
+    await session.commit()
     return success({"text": text})
 
 
 @router.post("/{novel_id}/timeline")
 async def timeline(
     novel_id: int,
+    req: AnalysisReq | None = None,
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
-    """生成时间线梳理（M8.2）。"""
-    text = await writing_service.generate_timeline(session, user.id, novel_id)
+    """生成时间线梳理（M8.2），结果按 (kind,detail) 覆盖缓存。"""
+    detail = (req.detail if req else "brief") or "brief"
+    text = await writing_service.generate_timeline(session, user.id, novel_id, detail)
+    await session.commit()
     return success({"text": text})
 
 
 @router.post("/{novel_id}/character-arc")
 async def character_arc(
     novel_id: int,
+    req: AnalysisReq | None = None,
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
-    """生成角色弧线概览（M8.3）。"""
-    text = await writing_service.generate_character_arc(session, user.id, novel_id)
+    """生成角色弧线概览（M8.3），结果按 (kind,detail) 覆盖缓存。"""
+    detail = (req.detail if req else "brief") or "brief"
+    text = await writing_service.generate_character_arc(session, user.id, novel_id, detail)
+    await session.commit()
     return success({"text": text})
+
+
+@router.get("/{novel_id}/analysis/cached")
+async def analysis_cached(
+    novel_id: int,
+    kind: str = Query(...),
+    detail: str = Query("brief"),
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """读取一份已缓存的概览类分析结果（M8 缓存复用）；无则返回 null。"""
+    data = await writing_service.get_cached_analysis(session, user.id, novel_id, kind, detail)
+    return success(data)
+
+
+@router.get("/{novel_id}/analysis/cacheds")
+async def analysis_cacheds(
+    novel_id: int,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """批量读取某小说全部已缓存概览（前端初始化直接展示，避免重复生成）。"""
+    items = await writing_service.get_cached_analyses(session, user.id, novel_id)
+    return success({"items": items})
 
 
 @router.get("/{novel_id}/continue-write/versions")

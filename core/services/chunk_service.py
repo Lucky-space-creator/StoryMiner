@@ -343,11 +343,16 @@ def _to_detail(r: Chunk) -> dict:
 
 
 async def list_chunks(session, owner_id, kb_id=None, chapter_id=None, disabled=None, page=1, size=20):
-    """切片列表（M4.1）：分页 + 过滤 + 补 kb 名。"""
+    """切片列表（M4.1）：分页 + 过滤 + 补 kb 名。
+
+    关键点：按 ID 升序返回；补 seq 为「从 1 开始的展示序号」（当前页内连续递增），
+        前端直接用 seq 作序号列，避免直接展示数据库大 ID。
+    """
     rows, total = await chunk_repo.list_chunks(session, owner_id, kb_id, chapter_id, disabled, page, size)
     views = []
-    for r in rows:
+    for i, r in enumerate(rows):
         v = _to_view(r)
+        v["seq"] = (page - 1) * size + i + 1
         if r.kb_id:
             kb = await kb_repo.get_kb(session, owner_id, r.kb_id)
             v["kb_name"] = kb.name if kb else ""
@@ -378,9 +383,14 @@ async def get_chunk_source(session, owner_id, chunk_id):
 
 
 async def search_chunks(session, owner_id, q, page=1, size=20):
-    """关键词检索（M4.4）。"""
+    """关键词检索（M4.4）：同样按 ID 升序，并补 seq 展示序号。"""
     rows, total = await chunk_repo.search_chunks(session, owner_id, q, page, size)
-    return paginate([_to_view(r) for r in rows], total, page, size)
+    views = []
+    for i, r in enumerate(rows):
+        v = _to_view(r)
+        v["seq"] = (page - 1) * size + i + 1
+        views.append(v)
+    return paginate(views, total, page, size)
 
 
 async def set_disabled(session, owner_id, chunk_id, disabled):
