@@ -40,6 +40,9 @@ DB_DSN = os.getenv("DB_DSN", _database.get("dsn", "postgresql+asyncpg://postgres
 JWT_SECRET = os.getenv("JWT_SECRET", _jwt.get("secret", "story-rag-dev-secret-change-me"))
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", _jwt.get("algorithm", "HS256"))
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", _jwt.get("expire_minutes", 60)))
+# 访问令牌有效期上限（天）：默认 7 天，避免频繁登录；
+# 续期接口可基于未过期令牌换新令牌，延长会话。
+JWT_EXPIRE_DAYS = int(os.getenv("JWT_EXPIRE_DAYS", _jwt.get("expire_days", 7)))
 
 # 上传限制（对齐 API 列表）
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", str(_CONFIG_DIR / _upload.get("dir", "uploads")))
@@ -118,6 +121,11 @@ ENABLE_LLM_CACHE = (
     .lower() == "true"
 )
 
+# LLM 结果缓存 TTL（秒）：默认 3600，可由 config.yml cache.ttl 或环境变量 CACHE_TTL 覆盖。
+# 仅在 ENABLE_LLM_CACHE=true 时生效（多 worker 下走 Redis 共享缓存）。
+_CACHE = _cfg.get("cache", {})
+CACHE_TTL = int(os.getenv("CACHE_TTL", _CACHE.get("ttl", 3600)))
+
 # LangGraph 编排开关（混合分析管道 M7）：默认关，安装 langgraph 且验证后开启
 #   优先级：环境变量 LANGGRAPH_ENABLED > config.yml langgraph.enabled > 默认 false
 LANGGRAPH_ENABLED = (
@@ -152,7 +160,10 @@ REDIS_URL = os.getenv("REDIS_URL", _redis.get("url", "redis://127.0.0.1:6363/0")
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", _redis.get("password", "")) or None
 
 _pipeline = _cfg.get("pipeline", {})
-USE_CELERY = str(os.getenv("USE_CELERY", _pipeline.get("async_mode", "false"))).lower() == "true"
+# 接通 Celery：默认 true 启用多 worker 并行（config.yml pipeline.async_mode），
+# 使已启动的 celery worker 真正消费后台分析任务，不再回落单进程串行队列。
+# 环境变量 USE_CELERY 仍可临时关闭（置 false）。
+USE_CELERY = str(os.getenv("USE_CELERY", _pipeline.get("async_mode", "true"))).lower() == "true"
 CELERY_WORKER_CONCURRENCY = int(os.getenv("CELERY_WORKER_CONCURRENCY", _pipeline.get("worker_concurrency", 8)))
 
 # celery 可用性探测（导入期不强制依赖；未安装则 CELERY_AVAILABLE=False，回落串行）

@@ -69,7 +69,7 @@ async def update_config(session: AsyncSession, owner_id: int, cfg_id: int, data:
         raise BizError(404, "模型配置不存在")
     if data.api_key is not None:
         cfg.api_key = crypto.encrypt(data.api_key)
-    for f in ("name", "provider", "model", "base_url", "llm_type", "weight", "timeout", "status", "extra"):
+    for f in ("name", "provider", "model", "base_url", "llm_type", "weight", "timeout", "status", "extra", "temperature", "max_tokens"):
         v = getattr(data, f)
         if v is not None:
             setattr(cfg, f, v)

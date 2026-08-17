@@ -20,7 +20,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from config import JWT_SECRET, JWT_ALGORITHM, JWT_EXPIRE_MINUTES
+from config import JWT_SECRET, JWT_ALGORITHM, JWT_EXPIRE_MINUTES, JWT_EXPIRE_DAYS
 from db import get_session
 from models.user import User
 from sqlalchemy import select
@@ -30,10 +30,32 @@ _security = HTTPBearer(auto_error=False)
 
 
 def create_access_token(user_id: int) -> str:
-    """签发访问令牌，sub=用户ID，含过期时间。"""
-    expire = datetime.now(timezone.utc) + timedelta(minutes=JWT_EXPIRE_MINUTES)
+    """签发访问令牌，sub=用户ID，过期时间由 JWT_EXPIRE_DAYS 控制（默认 7 天）。
+
+    整体思路：登录/注册/续期统一走此函数，令牌有效期长（7天）以降低登录频率。
+    关键点：过期以天为单位，避免分钟级短令牌导致频繁失效。
+    """
+    expire = datetime.now(timezone.utc) + timedelta(days=JWT_EXPIRE_DAYS)
     payload = {"sub": str(user_id), "exp": expire}
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def refresh_access_token(token: str) -> str:
+    """续期：用未过期的旧令牌换发新令牌（sub 不变，过期重新计算 7 天）。
+
+    整体思路：前端在令牌临近过期或用户活跃时调用 /auth/refresh 携带旧 token，
+    服务端校验旧 token 仍有效（未过期、可解码）即签发新 token，实现无感续期。
+    关键点：
+        1. 旧 token 必须未过期，jwt.decode 失败（含 exp 过期）直接抛 BizError(401)。
+        2. 续期不改 sub，仅刷新 exp，避免会话主体被篡改。
+        3. 不校验用户是否存在（旧 token 合法即代表曾登录），但调用方可选再验。
+    """
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        uid = int(payload.get("sub"))
+    except (JWTError, ValueError, TypeError):
+        raise BizError(401, "令牌无效或已过期，无法续期，请重新登录")
+    return create_access_token(uid)
 
 
 def decode_token(token: str) -> int:

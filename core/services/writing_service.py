@@ -22,6 +22,7 @@ from models.story_writing import ContinueWrite
 from repositories import novel_repo, character_repo, writing_repo, llm_repo
 from llm import langchain_factory as llm_adapters
 from common import crypto
+from common.cache_adapter import default_cache
 from common.exceptions import BizError
 from prompts import (
     build_summary_prompt, build_timeline_prompt, build_character_arc_prompt, build_continue_system,
@@ -97,7 +98,11 @@ async def generate_summary(session: AsyncSession, owner_id: int, novel_id: int, 
         raise BizError(400, "该小说暂无正文，无法生成概览")
     adapter = await _get_chat_adapter(session, owner_id)
     messages = [{"role": "user", "content": build_summary_prompt(novel.name, text, detail)}]
-    result = await adapter.chat(messages)
+    cache_key = f"writing:{owner_id}:{novel_id}:summary:{detail}:{hash(text)}"
+    result = default_cache.get(cache_key)
+    if result is None:
+        result = await adapter.chat(messages)
+        default_cache.set(cache_key, result)
     await writing_repo.save_analysis(session, owner_id, novel_id, "summary", detail, result)
     return result
 
@@ -110,7 +115,11 @@ async def generate_timeline(session: AsyncSession, owner_id: int, novel_id: int,
         raise BizError(400, "该小说暂无正文，无法生成时间线")
     adapter = await _get_chat_adapter(session, owner_id)
     messages = [{"role": "user", "content": build_timeline_prompt(novel.name, text, detail)}]
-    result = await adapter.chat(messages)
+    cache_key = f"writing:{owner_id}:{novel_id}:timeline:{detail}:{hash(text)}"
+    result = default_cache.get(cache_key)
+    if result is None:
+        result = await adapter.chat(messages)
+        default_cache.set(cache_key, result)
     await writing_repo.save_analysis(session, owner_id, novel_id, "timeline", detail, result)
     return result
 
@@ -130,7 +139,11 @@ async def generate_character_arc(session: AsyncSession, owner_id: int, novel_id:
     )
     adapter = await _get_chat_adapter(session, owner_id)
     messages = [{"role": "user", "content": build_character_arc_prompt(novel.name, chars_text, detail)}]
-    result = await adapter.chat(messages)
+    cache_key = f"writing:{owner_id}:{novel_id}:character_arc:{detail}:{hash(chars_text)}"
+    result = default_cache.get(cache_key)
+    if result is None:
+        result = await adapter.chat(messages)
+        default_cache.set(cache_key, result)
     await writing_repo.save_analysis(session, owner_id, novel_id, "character_arc", detail, result)
     return result
 

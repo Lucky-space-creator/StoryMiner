@@ -72,6 +72,8 @@
         <div class="grid grid-cols-2 gap-3">
           <Input v-model.number="form.weight" label="降级权重" type="number" />
           <Input v-model.number="form.timeout" label="超时(秒)" type="number" />
+          <Input v-model.number="form.temperature" label="温度" type="number" step="0.1" />
+          <Input v-model.number="form.max_tokens" label="最大Token" type="number" placeholder="留空不限制" />
         </div>
         <div class="flex justify-end gap-2">
           <Button variant="ghost" type="button" @click="showAdd = false">取消</Button>
@@ -125,7 +127,7 @@ const usageColumns = [
 const typeText = (t) => ({ chat: '对话', embed: '向量', image: '图像' }[t] || t)
 
 function emptyForm() {
-  return { name: '', provider: 'openai', llm_type: 'chat', model: '', api_key: '', base_url: '', weight: 0, timeout: 60 }
+  return { name: '', provider: 'openai', llm_type: 'chat', model: '', api_key: '', base_url: '', weight: 0, timeout: 60, temperature: 0.7, max_tokens: null }
 }
 
 onMounted(async () => {
@@ -155,6 +157,7 @@ function openEdit(row) {
     name: row.name, provider: row.provider, llm_type: row.llm_type,
     model: row.model, api_key: '', base_url: row.base_url || '',
     weight: row.weight ?? 0, timeout: row.timeout ?? 60,
+    temperature: row.temperature ?? 0.7, max_tokens: row.max_tokens ?? null,
   }
   showAdd.value = true
 }

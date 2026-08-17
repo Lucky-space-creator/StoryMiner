@@ -49,6 +49,7 @@ jwt:
   secret: "story-rag-dev-secret-change-me"
   algorithm: "HS256"
   expire_minutes: 60
+  expire_days: 7              # 访问令牌有效期（天），配合 /auth/refresh 续期
 
 # 上传限制（对齐 API 列表：TXT≤50MB、其他≤200MB、章节≤5000）
 upload:
@@ -100,11 +101,12 @@ langchain:
 langgraph:
   enabled: false
 
-# LLM 结果缓存（M5 P3 进程内 TTL）
-#   true：启用 cachetools.TTLCache，key=(model, novel_id, stage, hash(text))
+# LLM 结果缓存（M5 P3 共享缓存）
+#   true：启用结果缓存（多 worker 下走 Redis 共享缓存，单 worker 回落进程内 TTLCache），
+#         key=(owner_id, novel_id, kind, hash(text))，命中则跳过 LLM 调用省 token/耗时。
 #   false：每次重新调 LLM
 cache:
-  enabled: false
+  enabled: true
   ttl: 3600                 # 缓存有效期（秒）
 
 # 敏感字段加密密钥（M9 模型 api_key / 后续 MCP 凭据）

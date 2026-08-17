@@ -30,6 +30,7 @@ from services import task_service
 from llm import langchain_factory as llm_adapters
 from common import crypto, task_cancel
 from common.exceptions import BizError
+from common.cache_adapter import default_cache
 from config import TURBO_MAX_INPUT_CHARS
 
 # 人物抽取投喂量：主角色通常在开篇登场，极速模式无需投喂全本，
@@ -105,17 +106,31 @@ def _usage_tokens(usage) -> tuple[int, int]:
         return 0, 0
 
 
-async def _chat(session, owner_id: int, messages: list[dict], json_mode: bool = False) -> tuple[str, object]:
+async def _chat(session, owner_id: int, messages: list[dict], json_mode: bool = False, cache_key: str | None = None) -> tuple[str, object]:
     """取默认对话模型适配器并调用 chat，返回 (文本, 用量)。
 
     json_mode=True 时要求模型输出合法 JSON（ollama 走 format=json，其余走 response_format）。
+    cache_key 非空且 ENABLE_LLM_CACHE 时，先查共享缓存命中则直接返回，未命中则调用后写回。
     """
+    # 结果缓存：相同输入跳过 LLM 调用，省 token/耗时（多 worker 下走 Redis 共享）
+    if cache_key:
+        try:
+            hit = default_cache.get(cache_key)
+            if hit is not None:
+                return hit, None
+        except Exception:
+            pass
     cfgs = await llm_repo.list_for_dispatch(session, owner_id, "chat")
     if not cfgs:
         raise BizError(400, "尚未配置对话模型（llm_type=chat），请先在模型管理中添加")
     cfg = cfgs[0]
     adapter = llm_adapters.get_adapter(cfg, crypto.decrypt(cfg.api_key))
     text = await adapter.chat(messages, json_mode=json_mode)
+    if cache_key:
+        try:
+            default_cache.set(cache_key, text or "")
+        except Exception:
+            pass
     return text or "", adapter.get_last_usage()
 
 
@@ -202,7 +217,8 @@ async def _run_character_turbo(session, novel_id, owner_id, full_text, task_id, 
             session, owner_id,
             [{"role": "system", "content": _CHAR_EXTRACT_SYS},
              {"role": "user", "content": _CHAR_EXTRACT_USR.format(text=ch)}],
-            json_mode=True)
+            json_mode=True,
+            cache_key=f"turbo:{owner_id}:character_extract:{hash(ch)}")
         a, b = _usage_tokens(usage)
         tok_in += a
         tok_out += b
@@ -230,7 +246,8 @@ async def _run_character_turbo(session, novel_id, owner_id, full_text, task_id, 
             [{"role": "system", "content": _CHAR_EXP_SYS},
              {"role": "user", "content": _CHAR_EXP_USR.format(
                  names="、".join(names), text=full_text[:TURBO_CHAR_INPUT_CHARS])}],
-            json_mode=True)
+            json_mode=True,
+            cache_key=f"turbo:{owner_id}:character_exp:{hash(names)}:{hash(full_text[:TURBO_CHAR_INPUT_CHARS])}")
         a, b = _usage_tokens(usage)
         tok_in += a
         tok_out += b
@@ -259,7 +276,8 @@ async def _run_character_turbo(session, novel_id, owner_id, full_text, task_id, 
             [{"role": "system", "content": _CHAR_EVENTS_SYS},
              {"role": "user", "content": _CHAR_EVENTS_USR.format(
                  names="、".join(names), text=chapters_text[:TURBO_CHAR_INPUT_CHARS])}],
-            json_mode=True)
+            json_mode=True,
+            cache_key=f"turbo:{owner_id}:character_events:{hash(names)}:{hash(chapters_text[:TURBO_CHAR_INPUT_CHARS])}")
         a, b = _usage_tokens(usage)
         tok_in += a
         tok_out += b
@@ -377,7 +395,8 @@ async def run_turbo(
                 sys_p, usr_p = _prompt_for(analysis_type, ch)
                 text, usage = await _chat(
                     session, owner_id,
-                    [{"role": "system", "content": sys_p}, {"role": "user", "content": usr_p}])
+                    [{"role": "system", "content": sys_p}, {"role": "user", "content": usr_p}],
+                    cache_key=f"turbo:{owner_id}:{analysis_type}:{hash(ch)}")
                 partials.append(text)
                 a, b = _usage_tokens(usage)
                 tok_in += a
@@ -392,7 +411,8 @@ async def run_turbo(
                 sys_p, usr_p = _merge_prompt(partials)
                 summary, usage = await _chat(
                     session, owner_id,
-                    [{"role": "system", "content": sys_p}, {"role": "user", "content": usr_p}])
+                    [{"role": "system", "content": sys_p}, {"role": "user", "content": usr_p}],
+                    cache_key=f"turbo:{owner_id}:{analysis_type}:merge:{hash(tuple(partials))}")
                 a, b = _usage_tokens(usage)
                 tok_in += a
                 tok_out += b

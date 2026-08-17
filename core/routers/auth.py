@@ -16,8 +16,9 @@ from fastapi import APIRouter, Depends
 from schemas.user import UserCreate, UserLogin
 from models.user import User
 from db import get_session
-from auth.jwt import get_current_user
+from auth.jwt import get_current_user, refresh_access_token
 from common.response import success
+from common.exceptions import BizError
 from services import user_service
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -44,3 +45,17 @@ async def login(data: UserLogin, session=Depends(get_session)):
 async def me(user: User = Depends(get_current_user)):
     """获取当前用户信息。"""
     return success(user_service.to_out(user))
+
+
+@router.post("/refresh")
+async def refresh(creds: HTTPAuthorizationCredentials | None = Depends(_security)):
+    """续期：用未过期的旧令牌换发新令牌（有效期重新计算 7 天）。
+
+    整体思路：前端在令牌临近过期或用户活跃时调用，携带当前 Bearer 令牌；
+    服务端校验旧令牌仍有效即签发新令牌，前端替换本地令牌实现无感续期。
+    关键点：旧令牌必须未过期，否则返回 401 要求重新登录。
+    """
+    if not creds:
+        raise BizError(401, "缺少令牌，无法续期")
+    new_token = refresh_access_token(creds.credentials)
+    return success({"access_token": new_token, "token_type": "bearer"})
