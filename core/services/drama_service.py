@@ -180,7 +180,7 @@ async def _extract_characters(session: AsyncSession, novel_id: int, full_text: s
             hit_ids.append(cid)
     # jieba 候选补充：仅当候选名能对应到已有档案且未命中时计入
     try:
-        cands = nlp.extract_person_candidates(full_text, min_freq=1)
+        cands = nlp.extract_person_candidates(full_text, min_freq=nlp.MIN_FREQ_LOW)
         for c in cands:
             nm = c.get("name")
             cid = name_to_id.get(nm)

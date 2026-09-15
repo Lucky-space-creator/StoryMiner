@@ -17,6 +17,7 @@ import json
 import logging
 import time
 import traceback
+import asyncio
 
 from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -32,6 +33,10 @@ from common import nlp
 from config import LANGGRAPH_ENABLED
 
 logger = logging.getLogger(__name__)
+
+# 人物分析 LangGraph 整体超时上限（秒）：避免单个候选 LLM 长尾导致整图无限等待。
+# 正常几候选 ~ 数十秒~数分钟；30 分钟上限覆盖长文多候选，超时即失败可重试。
+CHARACTER_GRAPH_TIMEOUT = int(__import__("os").getenv("CHARACTER_GRAPH_TIMEOUT", "1800"))
 
 # 前端展示字段映射：列表项仅需 name/role/desc/appearances
 _LIST_FIELDS = ("id", "name", "role", "description", "appearances")
@@ -376,41 +381,8 @@ async def generate_profile_async(char_id: int, owner_id: int, task_id: int | Non
 # ---------------------------------------------------------------------------
 # M3 混合管道：先 nlp 确定性层出候选+出现次数，再 LLM 候选精析（见 _analyze_candidates）
 
-# 单候选精析提示词：给定人物名+相关片段，产出该人物结构化档案
-_CANDIDATE_PROMPT = """你是小说人物小传撰写助手。请根据提供的小说片段，为【指定人物】生成结构化档案。
-仅输出一个 JSON 对象，不要包含任何解释或 markdown 标记，格式严格如下：
-{
-  "role":"主角/配角/反派",
-  "gender":"男/女/未知",
-  "identity":"身份或职业",
-  "personality":"性格特点",
-  "appearance":"外貌特征",
-  "catchphrase":"口头禅",
-  "description":"150字以内的人物小传，包含大致经历"
-}
-人物姓名：{name}
-相关小说片段：
-{text}"""
-
-
-def _extract_context(text: str, name: str, max_chars: int = 4000) -> str:
-    """取含指定人名的相关片段拼接（候选精析喂料），截断到 max_chars。
-
-    优先截取人名出现的上下文窗口（前 200 + 后 400 字符），在前 max_chars 内覆盖尽量多出现点；
-    若人名未出现（极端情况），退回全文前 max_chars。
-    """
-    import re as _re
-    idxs = [m.start() for m in _re.finditer(_re.escape(name), text)]
-    if not idxs:
-        return text[:max_chars]
-    snippets, total = [], 0
-    for i in idxs:
-        s, e = max(0, i - 200), min(len(text), i + 400)
-        snippets.append(text[s:e])
-        total += (e - s)
-        if total >= max_chars:
-            break
-    return "\n……\n".join(snippets)[:max_chars]
+# 单候选精析提示词与人物上下文抽取统一收敛到 common.nlp（见 nlp.CANDIDATE_PROMPT /
+# nlp.extract_character_context），本模块直接复用，避免双份实现漂移（P1-9）。
 
 
 async def _call_llm(messages, *, cfg):
@@ -463,8 +435,8 @@ async def _analyze_candidates(session, novel_id, owner_id, full_text, cands, asy
             exc = task_cancel.TaskCancelled("用户主动取消人物", tok_in, tok_out)
             exc.usage_info = {"config_id": config_id, "model": cfg.model}
             raise exc
-        context = _extract_context(full_text, name)
-        prompt = _CANDIDATE_PROMPT.replace("{name}", name).replace("{text}", context)
+        context = nlp.extract_character_context(full_text, name)
+        prompt = nlp.CANDIDATE_PROMPT.replace("{name}", name).replace("{text}", context)
         messages = [{"role": "user", "content": prompt}]
         text, usage = await _call_llm(messages, cfg=cfg)
         if usage:
@@ -523,10 +495,34 @@ async def analyze_via_graph(session, novel_id, owner_id, full_text, cands, async
     graph = build_graph()
     initial = {
         "novel_id": novel_id, "owner_id": owner_id, "full_text": full_text,
-        "candidates": cands, "results": [], "created": 0, "skipped": 0,
+        "candidates": cands, "results": [], "created": 0, "skipped": 0, "failed": 0,
     }
-    final = await graph.ainvoke(
-        initial, config={"configurable": {"session": session, "cfg": cfg, "config_id": config_id}})
+    # 整体超时保护（P2-8）：避免单个候选 LLM 长尾/卡死导致整图无限等待；
+    # 超时后 asyncio.CancelledError 透传，配合 _analyze_node 的逐候选兜底，
+    # 已成功落库的人物不回滚（failed 计数可追溯血缘）。
+    try:
+        final = await asyncio.wait_for(
+            graph.ainvoke(
+                initial,
+                config={"configurable": {
+                    "session": session, "cfg": cfg, "config_id": config_id,
+                    "task_id": async_task_id,
+                    "thread_id": f"char_{async_task_id or novel_id}",
+                }}),
+            timeout=CHARACTER_GRAPH_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        # 超时视为分析未完成：已落库的保留，未完成的按 failed 记录血缘
+        created = 0
+        skipped = 0
+        n = len(cands)
+        if async_task_id:
+            await task_service.update_task_progress(
+                async_task_id, stage="failed", progress=100, status="failed",
+                error=f"人物分析超时（>{CHARACTER_GRAPH_TIMEOUT}s），候选 {n} 个未全部完成",
+                finished_at=datetime.now(timezone.utc),
+                extra={"created": created, "skipped": skipped, "candidates": n, "failed": n})
+        raise BizError(408, f"人物分析超时（>{CHARACTER_GRAPH_TIMEOUT}s），请减少正文量或稍后重试")
     created = final["created"]
     skipped = final["skipped"]
     n = len(final["candidates"])
@@ -617,7 +613,7 @@ async def analyze_and_create_characters(
             # 需求3：全书出场次数（jieba 词频 freq）< 10 的人物不入库。
             # 这里把确定性候选层的 min_freq 直接提到 10，freq<10 的候选根本不进入精析，
             # 从源头避免低频人物入库；_analyze_candidates 入库前再卡一次 freq<10 兜底。
-            cands = nlp.extract_person_candidates(full_text, min_freq=10)
+            cands = nlp.extract_person_candidates(full_text, min_freq=nlp.MIN_FREQ_STRICT)
             if cands and LANGGRAPH_ENABLED:
                 return await analyze_via_graph(session, novel_id, owner_id, full_text, cands, async_task_id)
             if cands:

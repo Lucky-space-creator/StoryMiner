@@ -15,7 +15,7 @@
 """
 from datetime import datetime, timezone
 
-from sqlalchemy import select, func
+from sqlalchemy import select, func, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.async_task import AsyncTask
@@ -96,9 +96,8 @@ async def update_task_progress(
             t.tokens_out = tokens_out
         if extra:
             t.extra = {**(t.extra or {}), **extra}
-        await session.commit()
         # 任务进入终态时，统一将累积的 token 用量写入 story_llm_usage 表
-        # 不在执行过程中逐次写入，减少 DB IO 次数，提升系统性能
+        # 复用同一会话（不在执行过程中逐次写入，减少 DB IO；P2-18 避免嵌套再开连接）
         if status in ("success", "failed", "cancelled") and (tokens_in or tokens_out) and usage_info:
             try:
                 await record_llm_usage(
@@ -108,9 +107,13 @@ async def update_task_progress(
                     task_type=usage_info.get("task_type") or "",
                     tokens_in=tokens_in or 0,
                     tokens_out=tokens_out or 0,
+                    task_id=task_id,
+                    session=session,
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning("LLM 用量统一写入失败 task=%s: %s", task_id, e)
+        # 任务字段更新与用量记录在同一会话、一次 commit 提交（P2-18：仅占用一条连接）
+        await session.commit()
         # V20：进度回写后向该 owner 的 SSE 订阅者广播快照，替代前端定时轮询
         from common.task_pubsub import publish
         try:
@@ -204,27 +207,41 @@ def _out(t: AsyncTask) -> dict:
 async def record_llm_usage(
     owner_id: int, config_id: int | None, model: str,
     task_type: str, tokens_in: int, tokens_out: int,
+    task_id: int | None = None, session=None,
 ) -> None:
-    """写入一条 LLM 调用用量记录到 story_llm_usage 表（独立会话）。
+    """写入一条 LLM 调用用量记录到 story_llm_usage 表。
 
-    整体思路：
-        每次 LLM chat/embed 调用完成后写入用量，供仪表盘 Token 计费和模型占比统计。
+    整体思路：每次 LLM chat/embed 调用完成后写入用量，供仪表盘 Token 计费和模型占比统计。
     关键点：
-        1. 独立 SessionLocal，避免与业务会话冲突。
-        2. 写入失败仅记日志，不影响主业务。
-    实现逻辑：
-        开独立会话 → add LLMUsage → commit。
+        1. 支持传入外部 session（如 update_task_progress 的同一会话）以复用连接（P2-18）；
+           未传入时自开 SessionLocal，避免与业务会话冲突。
+        2. 幂等约束（P2-17）：以 task_id 建立唯一索引，使用 INSERT ... ON CONFLICT DO NOTHING，
+           补偿/重试写入同 task_id 时不会重复计费。
+        3. model / task_type 缺省兜底为 "unknown"，避免写入空桶污染仪表盘统计（P2-19）。
+        4. 写入失败仅记日志，不影响主业务。
+    实现逻辑：拼接 insert 语句（含冲突忽略）→ 执行 → flush（外部会话）或 commit（自管会话）。
     """
     if not tokens_in and not tokens_out:
         return
+    own = session
+    close_own = False
     try:
+        if own is None:
+            own = SessionLocal()
+            close_own = True
         from models.llm_config import LLMUsage
-        async with SessionLocal() as session:
-            session.add(LLMUsage(
-                owner_id=owner_id, config_id=config_id, model=model,
-                task_type=task_type, tokens_in=tokens_in, tokens_out=tokens_out,
-            ))
-            await session.commit()
+        stmt = insert(LLMUsage).values(
+            owner_id=owner_id, config_id=config_id,
+            model=(model or "unknown"), task_type=(task_type or "unknown"),
+            tokens_in=tokens_in, tokens_out=tokens_out, task_id=task_id,
+        ).on_conflict_do_nothing(index_elements=["task_id"])
+        await own.execute(stmt)
+        if close_own:
+            await own.commit()
+        else:
+            await own.flush()
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).warning("LLM 用量记录失败: %s", e)
+        logger.warning("LLM 用量记录失败 task=%s: %s", task_id, e)
+    finally:
+        if close_own and own is not None:
+            await own.close()

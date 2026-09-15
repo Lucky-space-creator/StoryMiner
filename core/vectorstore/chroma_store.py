@@ -46,6 +46,16 @@ class ChromaStore(VectorStore):
 
     async def upsert(self, collection, ids, vectors, documents, metadatas=None):
         col = self._collection(collection)
+        # 空文本守卫（P2-13）：chroma 不允许空文档/空向量 upsert，空文本切片直接跳过，
+        # 避免整批 upsert 因单个空文档而 500。保留非空项，元数据按索引同步过滤。
+        keep = [k for k, d in enumerate(documents) if d and str(d).strip()]
+        if not keep:
+            return  # 全空则跳过，不触碰 chroma
+        ids = [ids[k] for k in keep]
+        vectors = [vectors[k] for k in keep]
+        documents = [documents[k] for k in keep]
+        if metadatas is not None:
+            metadatas = [metadatas[k] for k in keep]
         await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: col.upsert(
@@ -62,7 +72,10 @@ class ChromaStore(VectorStore):
             None,
             lambda: col.query(query_embeddings=[vector], n_results=top_k, where=where),
         )
-        ids = res["ids"][0]
+        ids = res["ids"][0] if res.get("ids") else []
+        if not ids:
+            # 空 collection / 无命中：res["ids"] 可能为空列表，取 [0] 会 IndexError（P2-13）
+            return []
         dists = res["distances"][0]
         return [(int(i), float(d)) for i, d in zip(ids, dists)]
 

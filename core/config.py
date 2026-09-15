@@ -14,10 +14,13 @@
 """
 import base64
 import hashlib
+import logging
 import os
 from pathlib import Path
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 # 配置目录与 yml 路径（与 config.py 同目录）
 _CONFIG_DIR = Path(__file__).resolve().parent
@@ -38,6 +41,9 @@ DB_DSN = os.getenv("DB_DSN", _database.get("dsn", "postgresql+asyncpg://postgres
 
 # JWT 鉴权
 JWT_SECRET = os.getenv("JWT_SECRET", _jwt.get("secret", "story-rag-dev-secret-change-me"))
+# P2-10：JWT 默认密钥仅用于本地开发；生产必须设置环境变量 JWT_SECRET 强密钥
+if JWT_SECRET == "story-rag-dev-secret-change-me":
+    logger.warning("JWT_SECRET 仍使用默认开发密钥，生产环境请通过环境变量 JWT_SECRET 设置强密钥！")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", _jwt.get("algorithm", "HS256"))
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", _jwt.get("expire_minutes", 60)))
 # 访问令牌有效期上限（天）：默认 7 天，避免频繁登录；
@@ -64,12 +70,19 @@ def _build_fernet_key(secret: str) -> bytes:
 _ENC_SECRET = os.getenv("ENCRYPTION_KEY", _encryption.get("key", "")) or JWT_SECRET
 ENCRYPTION_KEY = _build_fernet_key(_ENC_SECRET)
 
-# CORS（开发期放开，生产请收紧）
-_CORS_ORIGINS = _cors.get("origins", ["*"])
-if isinstance(_CORS_ORIGINS, list):
-    CORS_ORIGINS = _CORS_ORIGINS
+# CORS（开发期放开，生产请收紧；支持环境变量 CORS_ORIGINS 覆盖，逗号分隔）
+_CORS_ENV = os.getenv("CORS_ORIGINS")
+if _CORS_ENV:
+    CORS_ORIGINS = [o.strip() for o in _CORS_ENV.split(",") if o.strip()]
 else:
-    CORS_ORIGINS = str(_CORS_ORIGINS).split(",")
+    _CORS_ORIGINS = _cors.get("origins", ["*"])
+    if isinstance(_CORS_ORIGINS, list):
+        CORS_ORIGINS = _CORS_ORIGINS
+    else:
+        CORS_ORIGINS = str(_CORS_ORIGINS).split(",")
+# P2-11：生产环境应通过环境变量 CORS_ORIGINS 收紧来源，避免 "*"
+if "*" in CORS_ORIGINS:
+    logger.warning("CORS 允许全部来源（*），生产环境请通过环境变量 CORS_ORIGINS 指定可信域名！")
 
 # 后台异步任务线程池配置
 # 关键点：CPU 密集型任务（切章）与慢速 LLM 调用放到独立线程执行，

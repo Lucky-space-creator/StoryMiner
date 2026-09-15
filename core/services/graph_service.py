@@ -48,6 +48,10 @@ _TYPE_CN = {
 # 有效的实体类型白名单
 _VALID_ENTITY_TYPES = frozenset(_TYPE_CN.keys())
 
+# 实体类型匹配优先级（确定性）：同名实体跨多类型存在时，关系连接优先按此序取值，
+# 避免 frozenset 迭代顺序不确定导致关系指向随机类型（P2-12）。人物(character)优先。
+_ENTITY_TYPE_PRIORITY = tuple(_TYPE_CN.keys())
+
 # 实体类型默认颜色（与 story_entity_type 种子数据一致）
 _TYPE_COLORS = {
     "character": "#0d9488",
@@ -487,21 +491,28 @@ async def extract(session: AsyncSession, novel_id: int, owner_id: int, task_id: 
           f"（分块抽取 {chunk_count} 次 → 关系调用降至 {rel_calls} 次）")
 
     # ---------- Step 8: 批量落库关系 ----------
+    # 实体类型匹配优先级（确定性）：同名实体若跨多类型存在，优先 character → 其余按既定顺序，
+    # 消除「遍历 _VALID_ENTITY_TYPES 顺序不确定导致关系指向随机类型」的非确定性（P2-12）。
+    _TYPE_ORDER = sorted(_VALID_ENTITY_TYPES, key=lambda t: _ENTITY_TYPE_PRIORITY.index(t)
+                         if t in _ENTITY_TYPE_PRIORITY else len(_ENTITY_TYPE_PRIORITY))
     rel_set: set[tuple[int, int, str]] = set()  # (sid, tid, type) 去重
     rel_count = 0
     for rd in all_relations:
-        # 尝试所有可能实体类型匹配 source
-        sid = None
-        for etype in _VALID_ENTITY_TYPES:
-            sid = emap.get((rd["source"], etype))
-            if sid:
-                break
-        # 尝试所有可能实体类型匹配 target
-        tid = None
-        for etype in _VALID_ENTITY_TYPES:
-            tid = emap.get((rd["target"], etype))
-            if tid:
-                break
+        # 优先用关系自带的类型提示（若 LLM 返回 source_type/target_type）精确匹配，否则按优先级
+        s_hint = rd.get("source_type")
+        t_hint = rd.get("target_type")
+        sid = emap.get((rd["source"], s_hint)) if s_hint else None
+        tid = emap.get((rd["target"], t_hint)) if t_hint else None
+        if sid is None:
+            for etype in _TYPE_ORDER:
+                sid = emap.get((rd["source"], etype))
+                if sid:
+                    break
+        if tid is None:
+            for etype in _TYPE_ORDER:
+                tid = emap.get((rd["target"], etype))
+                if tid:
+                    break
         if not (sid and tid):
             continue
         key = (sid, tid, rd["type"])
@@ -537,6 +548,10 @@ async def run_extract(novel_id: int, owner_id: int, task_id: int | None = None) 
     """
     from db import SessionLocal
     async with SessionLocal() as session:
+        # 预初始化 token/usage 变量，确保 except 分支引用不会 NameError
+        _tokens_in = 0
+        _tokens_out = 0
+        _usage_info = None
         try:
             if task_id:
                 if task_cancel.is_cancelled(task_id):
@@ -575,16 +590,19 @@ async def run_extract(novel_id: int, owner_id: int, task_id: int | None = None) 
                     # 获取异常中已累积的 token + config 信息（extract 内 _qualify_relations 取消时会携带）
                     ct_in = getattr(e, "tokens_in", 0) or 0
                     ct_out = getattr(e, "tokens_out", 0) or 0
-                    # 从 result 获取 usage_info（正常流程），异常流程下回退到 task 自身信息
-                    cu = _usage_info if "_usage_info" in dir() else None
+                    # 从正常流程累积的 _usage_info 取（已在函数开头初始化为 None，无需 dir() 探测）
+                    cu = _usage_info
                     await task_service.update_task_progress(
                         task_id, stage="cancelled", status="cancelled",
                         error=e.reason, finished_at=datetime.now(timezone.utc),
                         tokens_in=ct_in, tokens_out=ct_out, usage_info=cu)
                 else:
+                    # 普通失败：同样持久化已累积的 token 用量与配置，确保门户能看到失败任务的用量统计
+                    # （_tokens_in/_tokens_out/_usage_info 在 try 块 extract 返回后已赋值）
                     await task_service.update_task_progress(
                         task_id, stage="failed", status="failed",
-                        error=str(e), finished_at=datetime.now(timezone.utc))
+                        error=str(e), finished_at=datetime.now(timezone.utc),
+                        tokens_in=_tokens_in, tokens_out=_tokens_out, usage_info=_usage_info)
             print(f"[graph] 抽取失败 novel={novel_id}: {e}")
 
 

@@ -61,6 +61,8 @@ class LLMUsage(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     owner_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
     config_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    # P2-17：任务级幂等约束，补偿/重试写入同 task_id 时由唯一索引拦截重复计费
+    task_id: Mapped[int | None] = mapped_column(BigInteger, index=True, unique=True)
     model: Mapped[str | None] = mapped_column(String(128))
     task_type: Mapped[str] = mapped_column(String(32), nullable=False)
     tokens_in: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

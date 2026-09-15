@@ -41,7 +41,7 @@ background:
   task_timeout: 1800
   # 切片嵌入/落库并发与批大小（Chroma-only 流式分批）
   embed_batch: 32                 # 单次嵌入请求携带的文本条数
-  embed_concurrency: 8            # 并发嵌入批次上限（信号量）
+  embed_concurrency: 12            # 并发嵌入批次上限（信号量，与对外设计口径一致）
   chroma_upsert_batch: 1000        # 每多少条切片执行一次 bulk_insert + Chroma upsert
 
 # JWT 鉴权
@@ -95,11 +95,11 @@ minio:
 langchain:
   enabled: true
 
-# LangGraph 工作流编排（M7，暂不启用）
-#   true：走 StateGraph 多步编排（preprocess→llm_extract→validate→retry→aggregate）
+# LangGraph 工作流编排（）
+#   true：走 StateGraph 多步编排（extract→analyze→persist）
 #   false：保留 task_service 线性流程
 langgraph:
-  enabled: false
+  enabled: true
 
 # LLM 结果缓存（M5 P3 共享缓存）
 #   true：启用结果缓存（多 worker 下走 Redis 共享缓存，单 worker 回落进程内 TTLCache），
