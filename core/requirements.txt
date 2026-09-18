@@ -24,9 +24,17 @@ langchain-ollama>=0.3
 jieba==0.42.1
 # 混合分析管道 M5：结果缓存薄封装（不自研 LRU，底层 cachetools.TTLCache）
 cachetools>=5.3
-# 混合分析管道 M7：LangGraph 工作流编排层（状态图 extract→analyze→persist）
+# 混合分析管道 M7：LangGraph 工作流编排层（状态图 extract→analyze→validate→persist）
 # 固定 0.2.x 系列以兼容现有 langchain 0.3.x / langchain-core 0.3.x（1.x 会强升 core 至 1.x 破坏兼容）
+# 注意：langgraph 1.x 才提供稳定的 interrupt/Command（HITL 人工审核），升级需单独排期回归。
 langgraph>=0.2,<0.3
+# P3 持久化 checkpoint：断点续跑能力（AsyncPostgresSaver）
+#   psycopg 为 AsyncPostgresSaver 的驱动（注意：其异步模式不支持 Windows 默认
+#   的 ProactorEventLoop，应用内已统一切换为 WindowsSelectorEventLoopPolicy）。
+#   安装 langgraph-checkpoint-postgres 会把 langgraph-checkpoint 升至 4.x，
+#   实测与 langgraph 0.2.76 兼容（P1/P2 全量测试通过）。
+langgraph-checkpoint-postgres>=3.0
+psycopg[binary]>=3.2
 
 # 混合分析管道 L1/L2：性能优化（连接池已内置于 SQLAlchemy，仅补齐异步任务依赖）
 # L2 异步任务架构：Celery + Redis broker（多 worker 并行，替代进程内串行队列）

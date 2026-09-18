@@ -39,6 +39,15 @@ _encryption = _cfg.get("encryption", {})
 # 数据库（异步 DSN）
 DB_DSN = os.getenv("DB_DSN", _database.get("dsn", "postgresql+asyncpg://postgres:root@localhost:5432/story_rag"))
 
+# 数据库（同步 DSN）：供 LangGraph 的 AsyncPostgresSaver（基于 psycopg）使用。
+# psycopg 不认 SQLAlchemy 的 +asyncpg 方言前缀，故需剥离为纯 postgresql://。
+# 若显式配置 LANGGRAPH_DB_DSN 则优先使用（便于 checkpoint 独立库/只读账号等场景）。
+LANGGRAPH_DB_DSN = os.getenv(
+    "LANGGRAPH_DB_DSN",
+    DB_DSN.replace("postgresql+asyncpg://", "postgresql://")
+          .replace("postgresql+psycopg://", "postgresql://"),
+)
+
 # JWT 鉴权
 JWT_SECRET = os.getenv("JWT_SECRET", _jwt.get("secret", "story-rag-dev-secret-change-me"))
 # P2-10：JWT 默认密钥仅用于本地开发；生产必须设置环境变量 JWT_SECRET 强密钥
@@ -139,12 +148,10 @@ ENABLE_LLM_CACHE = (
 _CACHE = _cfg.get("cache", {})
 CACHE_TTL = int(os.getenv("CACHE_TTL", _CACHE.get("ttl", 3600)))
 
-# LangGraph 编排开关（混合分析管道 M7）：默认关，安装 langgraph 且验证后开启
-#   优先级：环境变量 LANGGRAPH_ENABLED > config.yml langgraph.enabled > 默认 false
-LANGGRAPH_ENABLED = (
-    str(os.getenv("LANGGRAPH_ENABLED", _cfg.get("langgraph", {}).get("enabled", "false")))
-    .lower() == "true"
-)
+# 注（P2.5，2026-09-18）：原 LANGGRAPH_ENABLED 开关已移除。
+# 移除原因：线性冗余实现已删除，候选精析统一走 LangGraph 图（含质检 + 条件边重试），
+# 开关失去意义且会造成「两条路径行为不一致」的运维困惑。
+# 相关调优改用：GRAPH_LLM_CONCURRENCY（图内并行度）、CHARACTER_GRAPH_TIMEOUT（图超时）。
 
 # ───────────────────────────────────────────────────────────────────────────
 # L1 数据库连接池治理（混合分析管道性能优化）

@@ -18,7 +18,9 @@
     get_graph 批量取实体/关系并按度数计算节点权重；
     extract 先删后建→分块拼文本→逐块调 chat→合并解析→批量 upsert 落库。
 """
+import asyncio
 import json
+import os
 import re
 
 from datetime import datetime, timezone
@@ -141,6 +143,11 @@ _REL_QUAL_USER = """小说中「{a}」与「{b}」频繁共同出现。请基于
 
 # 共现候选边取 TopK 参与 LLM 定性（控制调用次数，残脉逆仙约260边→取前60）
 _COOCCUR_TOPK = 60
+
+# P4：分块抽取并发度（模块级单例信号量，不可放入函数内 —— 每次新建等于不限流）。
+# 取值参考：本地 Ollama 建议 1~2；云端 API 按其 RPM 限额换算。
+# 若启用 Celery 多 worker，总并发 = worker 数 × 该值，需相应下调。
+_EXTRACT_SEM = asyncio.Semaphore(int(os.getenv("GRAPH_EXTRACT_CONCURRENCY", "4")))
 
 
 def _format_candidates(cands: dict) -> str:
@@ -424,47 +431,71 @@ async def extract(session: AsyncSession, novel_id: int, owner_id: int, task_id: 
     cand_block = _format_candidates(nlp.extract_named_entities(text))
     print(f"[graph] 确定性候选实体已产出（供 LLM 参考）")
 
-    for idx, chunk in enumerate(chunks, 1):
+    # P4：分块抽取改为并发执行（原为串行 for 循环）。
+    # 并发度由 _EXTRACT_CONCURRENCY 控制（受 LLM 限流约束），
+    # 收益：N 块的总耗时从 N×t 降至 ceil(N/并发)×t。
+    # 关键点：分块之间无依赖（仅共享只读的 cand_block），故可安全并发；
+    #        合并去重在并发收敛后单点进行（避免并发写集合的竞态）。
+    async def extract_chunk(idx: int, chunk: str) -> tuple[int, list[dict], int, int]:
+        """抽取单块的实体：返回 (块序号, 实体列表, tok_in, tok_out)。
+
+        关键点：单块异常只影响该块（返回空结果），不阻断其他块。
+        """
         if task_id and task_cancel.is_cancelled(task_id):
-            raise task_cancel.TaskCancelled("用户主动取消任务", tok_in, tok_out)
-
-        # 更新进度（20%~85% 按块均匀分配，留出关系定性区间）
-        if task_id:
-            progress = 20 + int((idx - 1) / chunk_count * 65)
-            await task_service.update_task_progress(
-                task_id, stage=f"extracting_{idx}/{chunk_count}",
-                progress=progress, status="running",
-            )
-
-        # 调用 LLM：仅抽实体（关系由共现候选边另做定性，降低调用数）
-        # 实体抽取走 LangChain 调用层（_acall_llm）
+            raise task_cancel.TaskCancelled("用户主动取消任务", 0, 0)
         messages = [
             {"role": "system", "content": _ENTITY_SYSTEM},
-            {"role": "user", "content": _ENTITY_USER.replace("{candidates}", cand_block).replace("{text}", chunk)},
+            {"role": "user", "content": _ENTITY_USER.replace(
+                "{candidates}", cand_block).replace("{text}", chunk)},
         ]
-        raw, usage = await _acall_llm(messages, cfg=cfg)
-        if usage:
-            tok_in += usage.get("tokens_in", 0)
-            tok_out += usage.get("tokens_out", 0)
-        data = _parse_json(raw)
+        try:
+            async with _EXTRACT_SEM:              # 模块级信号量限流
+                raw, usage = await _acall_llm(messages, cfg=cfg)
+        except task_cancel.TaskCancelled:
+            raise
+        except Exception as e:                    # noqa: BLE001
+            print(f"[graph] 第{idx}/{chunk_count}块抽取失败，已跳过：{e}")
+            return idx, [], 0, 0
 
-        chunk_ent = 0
+        u_in = (usage or {}).get("tokens_in", 0)
+        u_out = (usage or {}).get("tokens_out", 0)
+        data = _parse_json(raw)
+        ents = []
         for ed in data.get("entities", []):
             name = (ed.get("name") or "").strip()
             if not name:
                 continue
-            etype = _normalize_type(ed.get("type", "character"))
-            key = (name, etype)
+            ents.append({
+                "name": name, "type": _normalize_type(ed.get("type", "character")),
+                "profile": ed.get("profile") or {},
+                "description": ed.get("description"),
+            })
+        return idx, ents, u_in, u_out
+
+    if task_id:
+        await task_service.update_task_progress(
+            task_id, stage=f"extracting_0/{chunk_count}",
+            progress=20, status="running")
+
+    # 并发抽取所有块（return_exceptions=False：取消异常需向上抛以终止任务）
+    results = await asyncio.gather(
+        *[extract_chunk(i, c) for i, c in enumerate(chunks, 1)])
+
+    # 收敛后单点合并去重（(name, type) 全局去重），避免并发写竞态
+    for _idx, ents, u_in, u_out in results:
+        tok_in += u_in
+        tok_out += u_out
+        for ed in ents:
+            key = (ed["name"], ed["type"])
             if key not in entity_set:
                 entity_set.add(key)
-                all_entities.append({
-                    "name": name, "type": etype,
-                    "profile": ed.get("profile") or {},
-                    "description": ed.get("description"),
-                })
-                chunk_ent += 1
+                all_entities.append(ed)
 
-        print(f"[graph] 第{idx}/{chunk_count}块: 实体{chunk_ent}个 (累计{len(all_entities)})")
+    if task_id:
+        await task_service.update_task_progress(
+            task_id, stage=f"extracted_{chunk_count}/{chunk_count}",
+            progress=85, status="running", tokens_in=tok_in, tokens_out=tok_out)
+    print(f"[graph] 分块抽取完成: {chunk_count} 块 → 去重后实体 {len(all_entities)} 个")
 
     # ---------- Step 6: 批量落库实体 ----------
     for ed in all_entities:

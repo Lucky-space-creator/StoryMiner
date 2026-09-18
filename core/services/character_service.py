@@ -30,7 +30,6 @@ from common import crypto
 from common import task_cancel
 from common.exceptions import BizError
 from common import nlp
-from config import LANGGRAPH_ENABLED
 
 logger = logging.getLogger(__name__)
 
@@ -409,95 +408,41 @@ async def _call_llm(messages, *, cfg):
     return (content if isinstance(content, str) else str(resp), usage)
 
 
-async def _analyze_candidates(session, novel_id, owner_id, full_text, cands, async_task_id):
-    """候选精析（M3 混合管道核心）：nlp 候选名单 → 每候选 LLM 精析 → 写 story_character。
-
-    出现次数取 nlp 准确 freq（零成本、不依赖 LLM）；调用次数 = 候选数，
-    远少于旧分片抽全类，落实「调用降 ≥50%」。无候选时不调用本函数（回退分片逻辑）。
-    """
-    cfgs = await llm_repo.list_for_dispatch(session, owner_id, "chat")
-    if not cfgs:
-        raise BizError(400, "尚未配置对话模型（llm_type=chat），请先在模型管理中添加")
-    cfg = cfgs[0]
-    config_id = cfg.id
-    n = len(cands)
-    created = skipped = 0
-    tok_in = tok_out = 0
-    for i, c in enumerate(cands):
-        name = c["name"]
-        freq = c.get("freq", 0)
-        lo = 20 + int(i / n * 65)
-        if async_task_id:
-            await task_service.update_task_progress(
-                async_task_id, stage="analyzing", progress=lo, status="running")
-        if async_task_id and task_cancel.is_cancelled(async_task_id):
-            await task_service.update_task_progress(async_task_id, tokens_in=tok_in, tokens_out=tok_out)
-            exc = task_cancel.TaskCancelled("用户主动取消人物", tok_in, tok_out)
-            exc.usage_info = {"config_id": config_id, "model": cfg.model}
-            raise exc
-        context = nlp.extract_character_context(full_text, name)
-        prompt = nlp.CANDIDATE_PROMPT.replace("{name}", name).replace("{text}", context)
-        messages = [{"role": "user", "content": prompt}]
-        text, usage = await _call_llm(messages, cfg=cfg)
-        if usage:
-            tok_in += usage.get("tokens_in", 0)
-            tok_out += usage.get("tokens_out", 0)
-        data = _parse_json(text)
-        item = data[0] if isinstance(data, list) else data
-        if not isinstance(item, dict):
-            continue
-        existing = await character_repo.get_by_novel_name(session, novel_id, name)
-        if existing:
-            skipped += 1
-            continue
-        # 需求3兜底：全书出场次数（jieba 词频 freq）< 10 不入库
-        if freq < 10:
-            skipped += 1
-            continue
-        c_obj = Character(
-            novel_id=novel_id, owner_id=owner_id, name=name,
-            role=(item.get("role") or "配角").strip() or "配角",
-            gender=(item.get("gender") or "").strip() or None,
-            identity=(item.get("identity") or "").strip() or None,
-            personality=(item.get("personality") or "").strip() or None,
-            appearance=(item.get("appearance") or "").strip() or None,
-            catchphrase=(item.get("catchphrase") or "").strip() or None,
-            description=(item.get("description") or "").strip()[:150] or None,
-            source="auto", appearances=freq,
-        )
-        session.add(c_obj)
-        created += 1
-    await session.commit()
-    # token 用量由终态 update_task_progress 统一写入 story_llm_usage
-    usage_info = {"config_id": config_id, "model": cfg.model, "task_type": "character_analysis"}
-    if async_task_id:
-        await task_service.update_task_progress(
-            async_task_id, stage="done", progress=100, status="success",
-            message=f"已创建 {created} 个人物" + (f"，跳过 {skipped} 个已存在" if skipped else ""),
-            finished_at=datetime.now(timezone.utc),
-            tokens_in=tok_in, tokens_out=tok_out, usage_info=usage_info,
-            extra={"created": created, "skipped": skipped, "candidates": n})
-    return {"created": created, "skipped": skipped, "candidates": n}
+# 注（P2.5，2026-09-18）：原线性实现 _analyze_candidates 已移除。
+# 移除原因：与 LangGraph 图的 _analyze_node / analyze_one 逻辑重复（双份实现漂移风险），
+# 且图内含质检与条件边重试，能力严格强于线性版。候选精析统一走 analyze_via_graph。
 
 
 async def analyze_via_graph(session, novel_id, owner_id, full_text, cands, async_task_id):
-    """M7 编排层入口：用 LangGraph 状态图执行人物分析（extract→analyze→persist）。
+    """M7 编排层入口：用 LangGraph 状态图执行人物分析（P1 质量闭环版）。
 
-    与 M3 线性 _analyze_candidates 产出一致（候选精析 + nlp 准确 appearances），
-    区别仅在于用状态图编排节点，便于后续扩展去重/质检/回退节点。
+    拓扑：extract → analyze → validate ─┬─(不合格且未超限)→ analyze 回退重试
+                                        └─(否则)→ persist
+
+    关键点（P1）：
+        1. 相比 M3 线性路径增加 validate 质检节点，LLM 产出不合格时可自动重试修正，
+           超限仍不合格的候选以 needs_review 兜底落库，保证不丢数据。
+        2. 初始输入必须非空且字段齐全（langgraph 要求至少写入一个已声明 channel）。
+        3. retry_count / rejected / rejected_final 为 P1 新增 state 字段。
     """
-    from graph.character_analysis_graph import build_graph
+    from graph.character_analysis_graph import build_graph, _MAX_RETRY
     cfgs = await llm_repo.list_for_dispatch(session, owner_id, "chat")
     if not cfgs:
         raise BizError(400, "尚未配置对话模型（llm_type=chat），请先在模型管理中添加")
     cfg = cfgs[0]
     config_id = cfg.id
     graph = build_graph()
+    # thread_id 与任务强绑定，支撑「按任务续跑」；无任务 id 时退化到小说级。
+    thread_id = f"char_task_{async_task_id}" if async_task_id else f"char_novel_{novel_id}"
     initial = {
         "novel_id": novel_id, "owner_id": owner_id, "full_text": full_text,
-        "candidates": cands, "results": [], "created": 0, "skipped": 0, "failed": 0,
+        "candidates": cands, "results": [], "created": 0, "skipped": 0,
+        # 注：new_results / tok_in / tok_out / failed 带 add reducer，
+        # 初始输入不传（传 0 或 [] 会触发一次多余累加）。
+        # P1 新增：质检与重试状态
+        "retry_count": 0, "rejected": [],
     }
-    # 整体超时保护（P2-8）：避免单个候选 LLM 长尾/卡死导致整图无限等待；
+    # 整体超时保护：避免单个候选 LLM 长尾/卡死导致整图无限等待；
     # 超时后 asyncio.CancelledError 透传，配合 _analyze_node 的逐候选兜底，
     # 已成功落库的人物不回滚（failed 计数可追溯血缘）。
     try:
@@ -507,7 +452,7 @@ async def analyze_via_graph(session, novel_id, owner_id, full_text, cands, async
                 config={"configurable": {
                     "session": session, "cfg": cfg, "config_id": config_id,
                     "task_id": async_task_id,
-                    "thread_id": f"char_{async_task_id or novel_id}",
+                    "thread_id": thread_id,
                 }}),
             timeout=CHARACTER_GRAPH_TIMEOUT,
         )
@@ -526,17 +471,37 @@ async def analyze_via_graph(session, novel_id, owner_id, full_text, cands, async
     created = final["created"]
     skipped = final["skipped"]
     n = len(final["candidates"])
+    # P1：质检与重试统计（供仪表盘与排障观测）
+    retry_rounds = final.get("retry_count", 0)
+    review_count = final.get("review_count", 0)
+    failed = final.get("failed", 0)
     # 从 graph state 中提取累积的 token 用量，终态统一写入 story_llm_usage
     tok_in = final.get("tok_in", 0)
     tok_out = final.get("tok_out", 0)
     if async_task_id:
         usage_info = {"config_id": config_id, "model": cfg.model, "task_type": "character_analysis_graph"}
+        msg = f"已创建 {created} 个人物"
+        if skipped:
+            msg += f"，跳过 {skipped} 个已存在"
+        if retry_rounds:
+            msg += f"，质检重试 {retry_rounds} 轮"
+        if review_count:
+            msg += f"，{review_count} 个待人工复核"
         await task_service.update_task_progress(
             async_task_id, stage="done", progress=100, status="success",
-            message=f"已创建 {created} 个人物" + (f"，跳过 {skipped} 个已存在" if skipped else ""),
+            message=msg,
             finished_at=datetime.now(timezone.utc),
             tokens_in=tok_in, tokens_out=tok_out, usage_info=usage_info,
-            extra={"created": created, "skipped": skipped, "candidates": n})
+            extra={"created": created, "skipped": skipped, "candidates": n,
+                   "retry_rounds": retry_rounds, "review_count": review_count,
+                   "failed": failed, "max_retry": _MAX_RETRY})
+    # P3：任务已到终态，该 thread 的 checkpoint 无续跑价值，主动清理防表膨胀。
+    # 关键点：清理失败仅告警，不阻断任务结果返回（另有定时兜底清理）。
+    try:
+        from graph.character_analysis_graph import cleanup_thread
+        await cleanup_thread(thread_id)
+    except Exception as e:                        # noqa: BLE001
+        logger.warning("checkpoint 清理异常 thread=%s: %s", thread_id, e)
     return {"created": created, "skipped": skipped, "candidates": n}
 
 
@@ -606,19 +571,17 @@ async def analyze_and_create_characters(
                 if not chapters:
                     raise BizError(400, "该小说暂无章节正文，请先上传并解析文档")
             full_text = "\n".join(ch.content for ch in chapters)
-            # ── M3/M7 混合管道：确定性层优先（候选精析） ──
+            # ── 混合管道：确定性层优先（候选精析） ──
             # 先 nlp 零成本产出人物候选与准确出现次数，再 LLM 逐候选精析小传；
             # 调用次数=候选数（远少于旧分片抽全类），落实「调用降 ≥50%」。
-            # 启用 LangGraph 编排层（M7）时走状态图路径，否则走 M3 线性路径。
+            # 编排统一走 LangGraph 状态图（P2.5 起移除线性冗余实现与开关，
+            # 消除双份实现漂移；图内含质检与条件边重试，能力严格强于线性版）。
             # 需求3：全书出场次数（jieba 词频 freq）< 10 的人物不入库。
-            # 这里把确定性候选层的 min_freq 直接提到 10，freq<10 的候选根本不进入精析，
-            # 从源头避免低频人物入库；_analyze_candidates 入库前再卡一次 freq<10 兜底。
+            # 候选层 min_freq 直接提到 10，freq<10 的候选根本不进入精析，
+            # 从源头避免低频人物入库；图内质检对产出再兜底校验。
             cands = nlp.extract_person_candidates(full_text, min_freq=nlp.MIN_FREQ_STRICT)
-            if cands and LANGGRAPH_ENABLED:
-                return await analyze_via_graph(session, novel_id, owner_id, full_text, cands, async_task_id)
             if cands:
-                return await _analyze_candidates(
-                    session, novel_id, owner_id, full_text, cands, async_task_id)
+                return await analyze_via_graph(session, novel_id, owner_id, full_text, cands, async_task_id)
             # 无候选（确定性层漏召回）回退旧分片逻辑（保底）
             # 长文策略：按阅读顺序分片，每片在 prompt 中携带简介；主要人物多在前段，优先覆盖
             chunks = _chunk_text(full_text)

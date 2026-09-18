@@ -13,6 +13,19 @@ FastAPI 应用入口
     创建 FastAPI；注册 CORS 中间件；注册 BizError/校验异常处理器；include_router；
     lifespan 内 create_all + seed_builtin。
 """
+# ── Windows 事件循环策略（P3，必须在导入任何异步库前设置）──
+# 背景：LangGraph 的 AsyncPostgresSaver 基于 psycopg 异步模式，而 psycopg 明确
+# 不支持 Windows 默认的 ProactorEventLoop，会抛：
+#   InterfaceError: Psycopg cannot use the 'ProactorEventLoop' to run in async mode.
+# 实测（2026-09-18）：默认 Proactor 下 psycopg 连接失败；切 Selector 后 psycopg
+# 与项目主驱动 asyncpg 均正常。故在 win32 平台统一切换为 Selector 策略。
+# 注意：该调用必须在事件循环创建之前执行，因此置于模块最顶部。
+import asyncio as _asyncio
+import sys as _sys
+
+if _sys.platform == "win32":
+    _asyncio.set_event_loop_policy(_asyncio.WindowsSelectorEventLoopPolicy())
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -183,8 +196,21 @@ async def lifespan(app: FastAPI):
     # 启动全局串行任务队列 worker：所有后台任务逐一排队执行
     from common import task_queue
     task_queue.start_worker()
+    # P3：启用 LangGraph 持久化 checkpoint（崩溃续跑 + 人工审核）。
+    # 失败自动降级为内存模式，不阻断服务启动。
+    try:
+        from graph import checkpointer
+        await checkpointer.open_checkpointer()
+    except Exception as e:                       # noqa: BLE001
+        import logging
+        logging.getLogger(__name__).warning("checkpoint 启用异常，降级内存模式：%s", e)
     yield
-    # 进程退出时优雅关闭：停止串行队列 worker + 后台线程池
+    # 进程退出时优雅关闭：停止串行队列 worker + 后台线程池 + 释放 checkpoint 连接池
+    try:
+        from graph import checkpointer
+        await checkpointer.close_checkpointer()
+    except Exception:
+        pass
     try:
         await task_queue.stop_worker()
     except Exception:
